@@ -2,7 +2,9 @@
 // the packed NV20 lines straight into the scanout buffers (no repack pass); the display controller scales
 // to the screen. Needs DRM master (desktop stopped). The DRM part follows our jxsplay (jxs-endpoint/player).
 //
-//   vc2play [--frames N] [--threads N] [--cpus a,b,..] [--conn id --crtc id] [--plane id] file.vc2
+//   vc2play [--frames N] [--threads N] [--cpus a,b,..] [--conn id --crtc id] [--plane id] [--gpu cl|vk] [--gpu-cpus a,b,..] file.vc2
+// --gpu: the last wavelet level on the GPU, which writes the NV20 lines into the scanout buffers itself (they are
+// handed to it as dma-bufs); --gpu-cpus: cores for the GPU driver's threads.
 // Defaults 224 / 93 = the Firefly's HDMI-A-2; plane 0 = the CRTC's own primary plane, found after the modeset.
 // Mode: the picture's size at 50 Hz if the screen has it (then paced by vblank), else its preferred mode
 // (paced by a timer). VC2_MODE=WxH@Hz picks another.
@@ -28,7 +30,7 @@
 #define FPS 50
 #define NBUF 3
 
-struct buf { uint32_t handle, pitch, fb; uint8_t *map; uint64_t size; };
+struct buf { uint32_t handle, pitch, fb; uint8_t *map; uint64_t size; int dmabuf; };
 static volatile int stop;
 static void on_sig(int s) { (void)s; stop = 1; }
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -49,7 +51,7 @@ static int dumb(int fd, uint32_t w, uint32_t h, uint32_t bpp, struct buf *b)
 
 int main(int argc, char **argv)
 {
-    int frames = 3000, threads = 3, cpus[64] = { 4, 5, 6 }, ncpu = 3;
+    int frames = 3000, threads = 3, cpus[64] = { 4, 5, 6 }, ncpu = 3, gpu = VC2_GPU_OFF, gcpus[64], ngcpu = 0;
     uint32_t conn_id = 224, crtc_id = 93, plane_id = 0;
     const char *in = 0;
     for (int i = 1; i < argc; i++) {
@@ -59,6 +61,12 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--conn")) { conn_id = atoi(v); i++; }
         else if (!strcmp(a, "--crtc")) { crtc_id = atoi(v); i++; }
         else if (!strcmp(a, "--plane")) { plane_id = atoi(v); i++; }
+        else if (!strcmp(a, "--gpu")) { gpu = !strcmp(v, "vk") ? VC2_GPU_VULKAN : VC2_GPU_OPENCL; i++; }
+        else if (!strcmp(a, "--gpu-cpus")) {
+            char *s = strdup(v);
+            for (char *t = strtok(s, ","); t && ngcpu < 64; t = strtok(0, ",")) gcpus[ngcpu++] = atoi(t);
+            i++;
+        }
         else if (!strcmp(a, "--cpus")) {
             char *s = strdup(v);
             ncpu = 0;
@@ -86,6 +94,7 @@ int main(int argc, char **argv)
     CPU_ZERO(&set); CPU_SET(cpus[0], &set);
     sched_setaffinity(0, sizeof set, &set);
     vc2_dec *dec = vc2_dec_new(threads, cpus);
+    if (gpu && vc2_dec_set_gpu(dec, gpu, ngcpu ? gcpus : 0, ngcpu)) { fprintf(stderr, "this build has no such GPU backend (make GPU=cl|vk)\n"); return 2; }
     vc2_frame f;
     if (vc2_dec_begin(dec, clip, au_len[0], &f) || f.chroma != 1 || f.bit_depth != 10) { fprintf(stderr, "need a 4:2:2 10-bit stream\n"); return 1; }
     const int W = f.width, H = f.height;
@@ -127,6 +136,8 @@ int main(int argc, char **argv)
         if (dumb(fd, W * 10 / 8, H * 2 + 1, 8, &b[i])) { perror("dumb"); return 1; } // 10 bits per sample, Y and CbCr lines alike
         uint32_t h[4] = { b[i].handle, b[i].handle }, p[4] = { b[i].pitch, b[i].pitch }, o[4] = { 0, b[i].pitch * H };
         if (drmModeAddFB2(fd, W, H, DRM_FORMAT_NV20, h, p, o, &b[i].fb, 0)) { perror("addfb2 NV20"); return 1; }
+        b[i].dmabuf = -1;
+        if (gpu && drmPrimeHandleToFD(fd, b[i].handle, DRM_CLOEXEC | DRM_RDWR, &b[i].dmabuf)) { perror("prime export"); return 1; }
     }
     uint32_t dw = mode.hdisplay, dh = (uint32_t)((uint64_t)dw * H / W); // fit into the screen, letterboxed
     if (dh > mode.vdisplay) { dh = mode.vdisplay; dw = (uint32_t)((uint64_t)dh * W / H); }
@@ -134,18 +145,28 @@ int main(int argc, char **argv)
     printf("%dx%d, %d threads; mode %ux%u@%u, plane %u -> %ux%u+%d+%d, paced by %s\n", W, H, threads, mode.hdisplay, mode.vdisplay,
            mode.vrefresh, plane_id, dw, dh, dx, dy, vsync ? "vblank" : "timer");
 
+    // GPU path: a second of decoding before the show starts, into every buffer once at least, so that the GPU's
+    // clock governor is up (it idles at 300 MHz) and the buffers are imported
+    for (int i = 0; gpu && !stop && i < FPS; i++) {
+        struct buf *cur = &b[i % NBUF];
+        vc2_dec_set_nv20(dec, cur->map, cur->map + (size_t)cur->pitch * H, cur->pitch);
+        vc2_dec_set_nv20_dmabuf(dec, cur->dmabuf, 0, (size_t)cur->pitch * H, cur->pitch);
+        if (vc2_dec_decode(dec, clip + au_off[i % naus], au_len[i % naus], &f)) { fprintf(stderr, "decode error\n"); return 1; }
+    }
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
-    double dec_sum = 0, dec_max = 0, t_begin = now(), c_begin = cpu();
+    double dec_sum = 0, dec_max = 0, gpu_sum = 0, t_begin = now(), c_begin = cpu();
     int shown = 0, late = 0;
     unsigned last_seq = 0;
     for (int i = 0; !stop && i < frames; i++) {
         struct buf *cur = &b[i % NBUF];
         double t0 = now();
         vc2_dec_set_nv20(dec, cur->map, cur->map + (size_t)cur->pitch * H, cur->pitch);
+        if (gpu) vc2_dec_set_nv20_dmabuf(dec, cur->dmabuf, 0, (size_t)cur->pitch * H, cur->pitch);
         if (vc2_dec_decode(dec, clip + au_off[i % naus], au_len[i % naus], &f)) { fprintf(stderr, "decode error\n"); break; }
         double dt = now() - t0;
         dec_sum += dt; if (dt > dec_max) dec_max = dt;
+        gpu_sum += vc2_dec_gpu_time(dec);
         next.tv_nsec += 1000000000 / FPS;
         if (next.tv_nsec >= 1000000000) { next.tv_sec++; next.tv_nsec -= 1000000000; }
         if (vsync) {
@@ -168,6 +189,7 @@ int main(int argc, char **argv)
     double wall = now() - t_begin;
     printf("done: frames %d in %.1f s (%.2f fps), missed vblanks %d, decode avg %.2f ms max %.2f ms, cpu %.2f ms/frame (%.2f cores)\n", shown, wall,
            shown / wall, late, dec_sum / (shown ? shown : 1) * 1e3, dec_max * 1e3, (cpu() - c_begin) / (shown ? shown : 1) * 1e3, (cpu() - c_begin) / wall);
+    if (vc2_dec_gpu_active(dec)) printf("gpu path %s, gpu busy %.2f ms/frame\n", vc2_dec_gpu_active(dec) == VC2_GPU_VULKAN ? "Vulkan" : "OpenCL", gpu_sum / (shown ? shown : 1) * 1e3);
     drmModeSetPlane(fd, plane_id, crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     drmDropMaster(fd);
     return 0;
