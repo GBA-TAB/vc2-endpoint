@@ -5,8 +5,9 @@
 // ring buffers, and the transform is launched in blocks of band rows while the CPU decodes on:
 //  - a thread owns the LL rows of its band of slice rows (the rows above come out of its warm-up and are
 //    wrong, so it does not write them); HL / LH / HH rows are right whoever writes them;
-//  - a thread launches the blocks that read only rows it has written itself; the few blocks across the
-//    border of two threads' bands are launched when all threads are done.
+//  - a thread launches the blocks that read only rows it has written itself; when it is done it also
+//    launches the few blocks across the border to the next thread's band, if that thread has written the rows
+//    they read (it does so at its start); what is left is launched when all threads are done.
 #include "vc2_gpu.h"
 #include <limits.h>
 #include <stdio.h>
@@ -108,6 +109,7 @@ static int gpu_begin(vc2_dec *d, vc2_frame *out)
     if (G->api->begin(G->g, &t)) return -1;
     memset(G->launched, 0, G->nblk);
     G->frame_open = 1;
+    for (int i = 0; i < d->threads; i++) __atomic_store_n(&d->cs[i].gpub, 0, __ATOMIC_RELEASE);
     gpu_casc_start(d, &d->cs[0], 0, d->pic.slices_y);
     for (int c = 0; out && c < 3; c++) { out->plane[c] = G->b.pix[c]; out->stride[c] = G->b.pstride[c]; }
     return 0;
@@ -121,44 +123,51 @@ static void gpu_wrote_rows(vc2_dec *d, int c, int r0, int r1)
     for (int o = 0; o < 4; o++) G->api->wrote(G->g, G->b.band[c][o] + (size_t)r0 * bw, (size_t)(r1 - r0) * bw * 2);
 }
 
-// a cascade starts: which LL rows it owns, and the first block it can launch by itself
+// the first block a cascade starting its own rows at band row ll0 can launch by itself
+static int gpu_first_block(const vc2_dec *d, int ll0) { return ll0 ? (ll0 + d->up + d->gpu->b.rb - 1) / d->gpu->b.rb : 0; }
+
+// a cascade starts: which LL rows it owns, and where it starts launching
 static void gpu_casc_start(vc2_dec *d, casc_t *k, int r0, int r1)
 {
-    struct dec_gpu *G = d->gpu;
-    const int depth = d->pic.depth, rb = G->b.rb, bh = d->pl[0].g.bh[depth];
+    const int depth = d->pic.depth;
     for (int c = 0; c < 3; c++) { // the same rows for every component: the band heights are equal
         k->ll0[c] = d->pl[c].ys[depth][r0];
         k->ll1[c] = r1 >= d->pic.slices_y ? INT_MAX : d->pl[c].ys[depth][r1];
     }
-    const int end = k->ll1[0] < bh ? k->ll1[0] : bh;
-    k->gblk = k->ll0[0] ? (k->ll0[0] + d->up + rb - 1) / rb : 0;
-    int row = k->gblk * rb - d->up;
-    k->gcl0 = k->gcl1 = row < k->ll0[0] ? k->ll0[0] : row > end ? end : row;
+    k->gblk = gpu_first_block(d, k->ll0[0]);
+    k->gcl1 = k->ll0[0];
+    __atomic_store_n(&k->gpub, 0, __ATOMIC_RELEASE);
+}
+
+static void gpu_launch(vc2_dec *d, casc_t *k, int g1, int rows_to)
+{
+    struct dec_gpu *G = d->gpu;
+    if (rows_to > k->gcl1) { for (int c = 0; c < 3; c++) gpu_wrote_rows(d, c, k->gcl1, rows_to); k->gcl1 = rows_to; }
+    if (!G->api->launch(G->g, (int)(k - d->cs), k->gblk, g1)) { // on an error the blocks are left for gpu_finish, which reports it
+        memset(G->launched + k->gblk, 1, g1 - k->gblk);
+        k->gblk = g1;
+    }
 }
 
 // after the cascade has advanced: launch the blocks whose inputs it has written (final: all it will ever have)
 static void gpu_progress(vc2_dec *d, casc_t *k, int final)
 {
     struct dec_gpu *G = d->gpu;
-    const int depth = d->pic.depth, rb = G->b.rb, thread = (int)(k - d->cs), bh = d->pl[0].g.bh[depth];
+    const int depth = d->pic.depth, rb = G->b.rb, bh = d->pl[0].g.bh[depth];
     if (!G->frame_open) return;
     int rows = k->syn_done[0][depth];
     for (int c = 1; c < 3; c++) if (k->syn_done[c][depth] < rows) rows = k->syn_done[c][depth];
+    __atomic_store_n(&k->gpub, rows, __ATOMIC_RELEASE);
     if (k->ll1[0] != INT_MAX && rows > k->ll1[0] - d->down) rows = k->ll1[0] - d->down; // below: the next thread's rows
-    const int g1 = rows >= bh ? G->nblk : rows / rb, g0 = k->gblk;
-    if (g1 - g0 >= (final ? 1 : G->batch)) {
-        const int need = g1 * rb + d->down < bh ? g1 * rb + d->down : bh;
-        if (need > k->gcl1) { for (int c = 0; c < 3; c++) gpu_wrote_rows(d, c, k->gcl1, need); k->gcl1 = need; }
-        if (!G->api->launch(G->g, thread, g0, g1)) { // on an error the blocks are left for gpu_finish, which reports it
-            memset(G->launched + g0, 1, g1 - g0);
-            k->gblk = g1;
-        }
-    }
+    const int g1 = rows >= bh ? G->nblk : rows / rb;
+    if (g1 - k->gblk >= (final ? 1 : G->batch)) gpu_launch(d, k, g1, g1 * rb + d->down < bh ? g1 * rb + d->down : bh);
     if (!final) return;
     const int end = k->ll1[0] < bh ? k->ll1[0] : bh; // the rest of the rows this cascade owns
-    for (int c = 0; c < 3; c++) { gpu_wrote_rows(d, c, k->ll0[0], k->gcl0); gpu_wrote_rows(d, c, k->gcl1, end); }
-    k->gcl0 = k->ll0[0];
-    if (end > k->gcl1) k->gcl1 = end;
+    if (end > k->gcl1) { for (int c = 0; c < 3; c++) gpu_wrote_rows(d, c, k->gcl1, end); k->gcl1 = end; }
+    if (k->ll1[0] < bh && k + 1 < d->cs + d->nchunks) { // the blocks across the border, up to the next thread's first
+        const int g2 = gpu_first_block(d, k->ll1[0]), to = g2 * rb + d->down < bh ? g2 * rb + d->down : bh;
+        if (g2 > k->gblk && __atomic_load_n(&k[1].gpub, __ATOMIC_ACQUIRE) >= (g2 * rb < bh ? g2 * rb : bh)) gpu_launch(d, k, g2, to);
+    }
 }
 
 // all cascades are done: launch what is left (the blocks across the threads' borders) and wait

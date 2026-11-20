@@ -77,7 +77,7 @@ enum { VC2_GPU_OFF = 0, VC2_GPU_OPENCL = 1, VC2_GPU_VULKAN = 2 };
 // the caller runs). Returns -1 if the backend is not compiled in.
 int vc2_dec_set_gpu(vc2_dec *d, int backend, const int *cpus, int ncpus);
 int vc2_dec_gpu_active(const vc2_dec *d);  // VC2_GPU_* in use for the last frame
-double vc2_dec_gpu_time(const vc2_dec *d); // GPU time of the last frame in seconds (kernel run times summed)
+double vc2_dec_gpu_time(const vc2_dec *d); // time the GPU was busy with the last frame, in seconds
 // NV20 target as a dma-buf (a scanout buffer) the GPU writes directly; fd < 0 = none. Without it the GPU
 // path fills the pointers of vc2_dec_set_nv20 through a copy. Used by the GPU path only: also call
 // vc2_dec_set_nv20 with the buffer's mapping, so that the CPU path has its target.

@@ -136,20 +136,28 @@ static int cl_launch(vc2_gpu *g, int thread, int blk0, int blk1)
 
 static int cl_finish(vc2_gpu *g, double *gpu_seconds)
 {
-    int rc = g->failed ? -1 : 0;
-    cl_ulong ns = 0;
+    int rc = g->failed ? -1 : 0, n = 0;
+    cl_ulong iv[64][2], busy = 0; // run intervals of the launches, kept sorted by start
     for (int i = 0; i < g->cfg.threads; i++) {
         if (g->nev[i] && clWaitForEvents(g->nev[i], g->ev[i])) rc = -1;
         for (int j = 0; j < g->nev[i]; j++) {
             cl_ulong s = 0, e = 0;
             clGetEventProfilingInfo(g->ev[i][j], CL_PROFILING_COMMAND_START, sizeof s, &s, 0);
             clGetEventProfilingInfo(g->ev[i][j], CL_PROFILING_COMMAND_END, sizeof e, &e, 0);
-            ns += e - s;
             clReleaseEvent(g->ev[i][j]);
+            if (n == 64) { busy += e - s; continue; }
+            int k = n++;
+            for (; k > 0 && iv[k - 1][0] > s; k--) { iv[k][0] = iv[k - 1][0]; iv[k][1] = iv[k - 1][1]; }
+            iv[k][0] = s; iv[k][1] = e;
         }
         g->nev[i] = 0;
     }
-    if (gpu_seconds) *gpu_seconds = ns * 1e-9;
+    for (int k = 0; k < n;) { // launches may run side by side: count the time any of them ran
+        cl_ulong s = iv[k][0], e = iv[k][1];
+        for (k++; k < n && iv[k][0] <= e; k++) if (iv[k][1] > e) e = iv[k][1];
+        busy += e - s;
+    }
+    if (gpu_seconds) *gpu_seconds = busy * 1e-9;
     if (!g->t.nv20) cache_range(g->pix.map, g->pix.size, 1); // the CPU may hold lines of the last frame
     else if (g->t.fd < 0) {
         const size_t n = (size_t)g->t.pitch * g->cfg.h;
@@ -207,8 +215,8 @@ static vc2_gpu *cl_create(const vc2_gpu_cfg *cfg, vc2_gpu_bufs *bufs)
         char opt[200];
         const char *src = vc2_idwt_cl_src;
         if (o && cfg->bit_depth != 10) break; // NV20 is 10-bit
-        snprintf(opt, sizeof opt, "-DWL=%d -DLANES=%d -DRB=%d -DNV20=%d -DPIX_OFF=%d -DPIX_MAX=%d", cfg->wavelet == VC2_WL_LEGALL5_3, LANES, RB, o,
-                 1 << (cfg->bit_depth - 1), (1 << cfg->bit_depth) - 1);
+        snprintf(opt, sizeof opt, "-DWL=%d -DLANES=%d -DRB=%d -DNV20=%d -DPIX_OFF=%d -DPIX_MAX=%d %s", cfg->wavelet == VC2_WL_LEGALL5_3, LANES, RB, o,
+                 1 << (cfg->bit_depth - 1), (1 << cfg->bit_depth) - 1, getenv("VC2_GPU_OPT") ? getenv("VC2_GPU_OPT") : "");
         g->prog[o] = clCreateProgramWithSource(g->ctx, 1, &src, 0, &err);
         if (err || clBuildProgram(g->prog[o], 1, &g->dev, opt, 0, 0)) {
             static char log[16384];

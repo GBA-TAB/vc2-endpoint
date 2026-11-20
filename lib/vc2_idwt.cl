@@ -84,17 +84,25 @@ static inline P hrow(V lo, V hi, int edge, UV em)
     return TO_P(ZIP(a, b));
 }
 
-// 8 samples of 10 bits -> 10 bytes (the NV15 / NV20 packing: sample 0 in the low bits)
+// 8 samples of 10 bits -> 10 bytes (the NV15 / NV20 packing: sample 0 in the low bits), in 16-bit operations
 static inline void pack8(ushort8 s, __global uchar *p)
 {
+#if PACK64
     uint4 a = convert_uint4(s.s0246) | (convert_uint4(s.s1357) << 10);
     ulong2 q = convert_ulong2(a.s02) | (convert_ulong2(a.s13) << 20);
     ulong w = q.s0 | (q.s1 << 40);
     vstore4(as_ushort4(w), 0, (__global ushort *)p);
     ((__global ushort *)p)[4] = (ushort)(q.s1 >> 24);
+#else
+    const ushort4 w = (ushort4)(s.s0 | (s.s1 << (ushort)10), (s.s1 >> (ushort)6) | (s.s2 << (ushort)4) | (s.s3 << (ushort)14),
+                                (s.s3 >> (ushort)2) | (s.s4 << (ushort)8), (s.s4 >> (ushort)8) | (s.s5 << (ushort)2) | (s.s6 << (ushort)12));
+    vstore4(w, 0, (__global ushort *)p);
+    ((__global ushort *)p)[4] = (s.s6 >> (ushort)4) | (s.s7 << (ushort)6);
+#endif
 }
 
-// one tile: nc components (2 = Cb and Cr together), band offsets bo[c][LL, HL, LH, HH], first column pair k0, first row i0
+// one tile: nc components (2 = Cb and Cr for the CbCr plane: Cb first, its rows kept while Cr is computed; both at
+// once would need more registers than the G610 has), band offsets off[LL, HL, LH, HH], first column pair k0, first row i0
 static inline void tile(__global const short *cf, __global uchar *out, const int nc, const int mode, const int4 offa, const int4 offb,
                         const int bw, const int bh, const int k0, const int i0, const int oofs, const int ostride, const int oh)
 {
@@ -103,74 +111,71 @@ static inline void tile(__global const short *cf, __global uchar *out, const int
     const int jl = k0 == 0 ? 2 : 0, jr = min(bw + 1 - k0, LANES - 1); // the lanes of columns 0 and bw - 1
     const int edge = k0 == 0 || bw + 1 - k0 < LANES - 1;
     const UV em = TO_UV(clamp(IOTA, (short)jl, (short)jr));
-    const int bo[2][4] = { { offa.s0, offa.s1, offa.s2, offa.s3 }, { offb.s0, offb.s1, offb.s2, offb.s3 } };
-    V h0[2][2], e0[2][2];
+    P keep[2 * RB];
+    for (int c = 0; c < nc; c++) {
+        const int4 off = c ? offb : offa;
+        __global const short *l[2] = { cf + off.s0 + k0 - 2, cf + off.s1 + k0 - 2 }, *h[2] = { cf + off.s2 + k0 - 2, cf + off.s3 + k0 - 2 };
+        V h0[2], e0[2];
 #if LA == 2
-    V h1[2][2], e1[2][2], em1[2][2];
+        V h1[2], e1[2], em1[2];
 #endif
-    for (int c = 0; c < nc; c++)
         for (int s = 0; s < 2; s++) {
-            __global const short *l = cf + bo[c][s] + k0 - 2, *h = cf + bo[c][2 + s] + k0 - 2;
-            h0[c][s] = VLOAD(h + i0 * bw);
-            e0[c][s] = evrow(l, h, i0, bw, bh);
+            h0[s] = VLOAD(h[s] + i0 * bw);
+            e0[s] = evrow(l[s], h[s], i0, bw, bh);
 #if LA == 2
-            h1[c][s] = VLOAD(h + min(i0 + 1, bh - 1) * bw);
-            e1[c][s] = evrow(l, h, i0 + 1, bw, bh);
-            em1[c][s] = evrow(l, h, i0 - 1, bw, bh);
+            h1[s] = VLOAD(h[s] + min(i0 + 1, bh - 1) * bw);
+            e1[s] = evrow(l[s], h[s], i0 + 1, bw, bh);
+            em1[s] = evrow(l[s], h[s], i0 - 1, bw, bh);
 #endif
         }
-    for (int i = i0; i < i1; i++) {
-        P r0[2], r1[2];
-        for (int c = 0; c < nc; c++) {
+        for (int i = i0; i < i1; i++) {
             V ev[2], od[2];
             for (int s = 0; s < 2; s++) {
-                __global const short *l = cf + bo[c][s] + k0 - 2, *h = cf + bo[c][2 + s] + k0 - 2;
                 const int n = i + LA;
 #if LA == 1
-                V hn = h0[c][s], en = e0[c][s];
-                if (n < bh) { hn = VLOAD(h + n * bw); en = UPD(VLOAD(l + n * bw), h0[c][s], hn); }
-                ev[s] = e0[c][s];
-                od[s] = pred(h0[c][s], en, e0[c][s], en, en);
-                h0[c][s] = hn; e0[c][s] = en;
+                V hn = h0[s], en = e0[s];
+                if (n < bh) { hn = VLOAD(h[s] + n * bw); en = UPD(VLOAD(l[s] + n * bw), h0[s], hn); }
+                ev[s] = e0[s];
+                od[s] = pred(h0[s], en, e0[s], en, en);
+                h0[s] = hn; e0[s] = en;
 #else
-                V hn = h1[c][s], en = e1[c][s];
-                if (n < bh) { hn = VLOAD(h + n * bw); en = UPD(VLOAD(l + n * bw), h1[c][s], hn); }
-                ev[s] = e0[c][s];
-                od[s] = pred(h0[c][s], em1[c][s], e0[c][s], e1[c][s], en);
-                h0[c][s] = h1[c][s]; h1[c][s] = hn;
-                em1[c][s] = e0[c][s]; e0[c][s] = e1[c][s]; e1[c][s] = en;
+                V hn = h1[s], en = e1[s];
+                if (n < bh) { hn = VLOAD(h[s] + n * bw); en = UPD(VLOAD(l[s] + n * bw), h1[s], hn); }
+                ev[s] = e0[s];
+                od[s] = pred(h0[s], em1[s], e0[s], e1[s], en);
+                h0[s] = h1[s]; h1[s] = hn;
+                em1[s] = e0[s]; e0[s] = e1[s]; e1[s] = en;
 #endif
             }
-            r0[c] = hrow(ev[0], ev[1], edge, em);
-            r1[c] = hrow(od[0], od[1], edge, em);
-        }
-        for (int t = 0; t < 2; t++) {
-            const int y = 2 * i + t;
-            if (y >= oh) break;
-            const P a = t ? r1[0] : r0[0];
-            if (mode == PLANAR) {
-                __global ushort *p = (__global ushort *)out + oofs + y * ostride + 2 * k0;
+            for (int t = 0; t < 2; t++) {
+                const int y = 2 * i + t;
+                if (y >= oh) break;
+                const P a = hrow(t ? od[0] : ev[0], t ? od[1] : ev[1], edge, em);
+                if (mode == PLANAR) {
+                    __global ushort *p = (__global ushort *)out + oofs + y * ostride + 2 * k0;
 #if LANES == 8
-                vstore8(a, 0, p);
+                    vstore8(a, 0, p);
 #else
-                vstore16(a, 0, p);
+                    vstore16(a, 0, p);
 #endif
-            } else if (mode == NV20_Y) {
-                __global uchar *p = out + oofs + y * ostride + k0 / 2 * 5;
+                } else if (mode == NV20_Y) {
+                    __global uchar *p = out + oofs + y * ostride + k0 / 2 * 5;
 #if LANES == 8
-                pack8(a, p);
+                    pack8(a, p);
 #else
-                pack8(a.lo, p); pack8(a.hi, p + 10);
+                    pack8(a.lo, p); pack8(a.hi, p + 10);
 #endif
-            } else {
-                __global uchar *p = out + oofs + y * ostride + k0 * 5;
-                const P b = t ? r1[1] : r0[1];
+                } else if (c == 0) keep[y - 2 * i0] = a;
+                else {
+                    __global uchar *p = out + oofs + y * ostride + k0 * 5;
+                    const P b = keep[y - 2 * i0];
 #if LANES == 8
-                pack8(ZIP4(a.lo, b.lo), p); pack8(ZIP4(a.hi, b.hi), p + 10);
+                    pack8(ZIP4(b.lo, a.lo), p); pack8(ZIP4(b.hi, a.hi), p + 10);
 #else
-                pack8(ZIP4(a.s0123, b.s0123), p); pack8(ZIP4(a.s4567, b.s4567), p + 10);
-                pack8(ZIP4(a.s89ab, b.s89ab), p + 20); pack8(ZIP4(a.scdef, b.scdef), p + 30);
+                    pack8(ZIP4(b.s0123, a.s0123), p); pack8(ZIP4(b.s4567, a.s4567), p + 10);
+                    pack8(ZIP4(b.s89ab, a.s89ab), p + 20); pack8(ZIP4(b.scdef, a.scdef), p + 30);
 #endif
+                }
             }
         }
     }
