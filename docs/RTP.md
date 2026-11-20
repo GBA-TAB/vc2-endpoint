@@ -1,6 +1,7 @@
 # VC-2 HQ over RTP (RFC 8450): design note
 
-Status: design only. Nothing here has been run on a network; the repo's tools are file-based.
+Status: design only. Nothing here has been run on a network; the repo's tools are file-based. The packet
+layout below is written from memory of RFC 8450: check it against the RFC before building on it.
 
 ## What RFC 8450 carries
 
@@ -32,9 +33,10 @@ transform parameters and slice bytes untouched, so the conversion is a re-framin
    is 768 bytes on average and a 64x16 slice 384 bytes, so 64x16 leaves the cap rarely active.
 2. **Truncated slices are plain VC-2**, but some receivers get them wrong (ffmpeg's decoder reads one byte
    past a short component and can produce a stray coefficient). `--no-truncate` writes every coefficient
-   and costs about 2 dB at 2-3 bpp; use it only towards receivers known to need it.
+   and costs 5 dB at 3 bpp (it cannot go below about 2.1 bpp at all); use it only towards receivers known
+   to need it.
 3. **Constant bit rate per picture, or per group of slice rows.** `--rc-rows N` spends the budget per N
-   slice rows instead of per picture (0.15 dB at 3 bpp for N = 1). With N = 1 the sender never has to hold
+   slice rows instead of per picture (0.23 dB at 3 bpp for N = 1). With N = 1 the sender never has to hold
    more than one slice row before sending, and a ST 2110-21-style narrow sender is possible: packets leave at a
    constant rate while the picture is still being encoded.
 
@@ -48,7 +50,7 @@ transform parameters and slice bytes untouched, so the conversion is a re-framin
   delivers one row every 0.29 ms.
 - Decoder: `vc2_dec_begin` / `vc2_dec_feed` decode every complete slice row on arrival and return the number
   of finished picture lines. Output trails the input by the same filter reach. On the Firefly the last
-  line is ready 0.7 ms after the last byte of a 1080p50 picture (measured, see the README).
+  line is ready 0.65 ms after the last byte of a 1080p50 picture (measured, see the README).
 - Display: a receiver that starts scan-out one filter reach (plus a safety margin) after the first slice
   row arrives never waits for the whole picture. The player in this repo shows whole frames; a
   line-locked output needs a genlocked display timing (PTP) and is open.
