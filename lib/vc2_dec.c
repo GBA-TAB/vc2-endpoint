@@ -3,6 +3,13 @@
 #define _GNU_SOURCE
 #include "vc2_priv.h"
 #include <time.h>
+#ifdef VC2_PROF
+#include <stdio.h>
+static double prof_t[3];
+#define PROF(i, t0) (prof_t[i] += now() - (t0))
+#else
+#define PROF(i, t0) ((void)(t0))
+#endif
 
 #define T int32_t
 #define SUF _32
@@ -40,6 +47,8 @@ struct vc2_dec {
     int fin16, down, strip_rows;
     plane_t pl[3];
     void **scratch;            // per thread
+    struct escratch_s *es;     // per thread: entropy decoding buffers
+    int max_coefs, ref_entropy;
     const uint8_t *au;
     const uint8_t *slices;     // first slice
     size_t slices_pos;         // offset of the slice data within the access unit
@@ -113,55 +122,229 @@ DEC_BAND(dec_band_16, int16_t)
 
 static inline int band16(const vc2_dec *d, int l) { return d->fin16 && (l ? l : 1) == d->pic.depth; }
 
-// decode slices [sx0, sx1) of slice row sy
-static void dec_slices(vc2_dec *d, int sy, int sx0, int sx1)
+// --- table-driven entropy decoding ---------------------------------------------------------------------------
+// One lookup of VLC_LB bits yields every coefficient that is complete within them: the count, the bits used,
+// and up to three nonzero values with their positions (unused slots repeat a used one, so the three stores
+// need no branch). The values go to a linear buffer of quantised coefficients; dequantisation is a second,
+// vectorised pass per subband row.
+#define VLC_LB 12
+typedef struct { uint8_t nbits, ncoef, pos[3]; int8_t val[3]; } vlc_entry;
+static vlc_entry vlc_lut[1 << VLC_LB];
+
+static void vlc_lut_init(void)
 {
-    const int depth = d->pic.depth, nx = d->pic.slices_x, scaler = d->pic.size_scaler;
-    for (int c = 0; c < 3; c++) {
-        plane_t *p = &d->pl[c];
-        for (int l = 0; l <= depth; l++) {
-            int x0 = p->xs[l][sx0], x1 = p->xs[l][sx1], y0 = p->ys[l][sy], y1 = p->ys[l][sy + 1];
-            size_t es = band16(d, l) ? 2 : 4;
-            for (int o = l ? 1 : 0; o < (l ? 4 : 1); o++)
-                for (int y = y0; y < y1; y++)
-                    memset((uint8_t *)p->band[l][o] + ((size_t)y * p->g.bw[l] + x0) * es, 0, (x1 - x0) * es);
+    for (int idx = 0; idx < 1 << VLC_LB; idx++) {
+        vlc_entry e = { 0, 0, { 0, 0, 0 }, { 0, 0, 0 } };
+        int pos = 0, nnz = 0;
+#define BIT(i) ((idx >> (VLC_LB - 1 - (i))) & 1)
+        while (pos < VLC_LB) {
+            if (BIT(pos)) { pos++; e.ncoef++; continue; }
+            int k = 1, v = 1;
+            while (pos + 2 * k < VLC_LB && !BIT(pos + 2 * k)) k++;
+            if (pos + 2 * k + 1 >= VLC_LB || nnz == 3) break; // incomplete, or no slot left
+            for (int i = 0; i < k; i++) v = (v << 1) | BIT(pos + 2 * i + 1);
+            v -= 1;
+            e.pos[nnz] = e.ncoef; e.val[nnz] = BIT(pos + 2 * k + 1) ? -v : v;
+            nnz++; e.ncoef++;
+            pos += 2 * k + 2;
+        }
+#undef BIT
+        e.nbits = pos;
+        for (int i = nnz; i < 3; i++) { e.pos[i] = e.pos[0]; e.val[i] = e.val[0]; }
+        vlc_lut[idx] = e;
+    }
+}
+
+// One bit stream (a slice component) being decoded into a linear buffer of quantised values.
+typedef struct { const uint8_t *buf; size_t bp, endbit; int16_t *out; int i, n; int *coded; } vlc_stream;
+
+// One lookup. Bits after the end of the component read as 1 (zero coefficients). Returns 0 when the stream
+// is finished: all coefficients decoded or the data used up (*coded says how many are there; -1 = a value
+// does not fit 16 bits).
+static inline __attribute__((always_inline)) int vlc_step(vlc_stream *s)
+{
+    if (s->i >= s->n || s->bp >= s->endbit) { *s->coded = s->i < s->n ? s->i : s->n; return 0; }
+    uint64_t w = load_be64(s->buf + (s->bp >> 3)) << (s->bp & 7);
+    if (__builtin_expect(s->bp + 64 > s->endbit, 0)) w |= ~0ull >> (s->endbit - s->bp);
+    vlc_entry e;
+    memcpy(&e, &vlc_lut[w >> (64 - VLC_LB)], sizeof e);
+    if (__builtin_expect(e.ncoef == 0, 0)) { // a long code: bit by bit
+        uint64_t m = w & 0xAAAAAAAAAAAAAAAAull;
+        int k = m ? vc2_clz64(m) >> 1 : 27;
+        if (k > 27) k = 27;
+        uint32_t mag = 1;
+        for (int j = 0; j < k; j++) mag = (mag << 1) | ((w >> (62 - 2 * j)) & 1);
+        mag -= 1;
+        if (mag > 32767) { *s->coded = -1; return 0; }
+        s->out[s->i++] = (w >> (62 - 2 * k)) & 1 ? -(int16_t)mag : (int16_t)mag;
+        s->bp += 2 * k + 2;
+        return 1;
+    }
+    int16_t *o = s->out + s->i;
+    o[e.pos[0]] = e.val[0];
+    o[e.pos[1]] = e.val[1];
+    o[e.pos[2]] = e.val[2];
+    s->i += e.ncoef; s->bp += e.nbits;
+    return 1;
+}
+
+// Decodes a list of streams, four at a time: the lookups form one dependency chain per stream, so four
+// streams side by side run about as fast as the core can execute them.
+static void vlc_decode_all(vlc_stream *st, int count)
+{
+    vlc_stream a, b, c, d;
+    int next = 0;
+    if (count >= 4) {
+        a = st[0]; b = st[1]; c = st[2]; d = st[3];
+        next = 4;
+        for (;;) {
+            if (!vlc_step(&a)) { if (next == count) { st[0] = b; st[1] = c; st[2] = d; count = 3; goto rest; } a = st[next++]; }
+            if (!vlc_step(&b)) { if (next == count) { st[0] = a; st[1] = c; st[2] = d; count = 3; goto rest; } b = st[next++]; }
+            if (!vlc_step(&c)) { if (next == count) { st[0] = a; st[1] = b; st[2] = d; count = 3; goto rest; } c = st[next++]; }
+            if (!vlc_step(&d)) { if (next == count) { st[0] = a; st[1] = b; st[2] = c; count = 3; goto rest; } d = st[next++]; }
         }
     }
-    for (int sx = sx0; sx < sx1; sx++) {
-        const uint8_t *s = d->slices + d->off[sy * nx + sx] + d->pic.prefix_bytes;
-        int qi = *s++;
-        uint32_t qf[VC2_MAX_DEPTH + 1][4], qo[VC2_MAX_DEPTH + 1][4];
-        for (int l = 0; l <= depth; l++)
+rest:
+    for (int j = 0; j < count; j++) {
+        a = st[j];
+        while (vlc_step(&a)) {}
+    }
+}
+
+// dequantise one row of quantised values into 16-bit coefficients
+static inline void dequant_row_16(const int16_t *v, int16_t *dst, int w, uint32_t qf, uint32_t qo)
+{
+    int x = 0;
+    if (qf < 32768 * 4 && qo < 32768) {
+        const int16_t qh = (int16_t)(qf >> 2), ql = (int16_t)(qf & 3), o = (int16_t)qo;
+        for (; x + 8 <= w; x += 8) {
+            vc2_v16 a = *(const vc2_v16 *)(v + x), sg = a >> 15, m = (a ^ sg) - sg;
+            vc2_v16 c = m * qh + ((m * ql + o) >> 2);
+            c = ((c ^ sg) - sg) & (a != 0);
+            *(vc2_v16 *)(dst + x) = c;
+        }
+    }
+    for (; x < w; x++) {
+        int a = v[x], m = a < 0 ? -a : a;
+        int32_t c = (int32_t)(((uint32_t)m * qf + qo) >> 2);
+        dst[x] = (int16_t)(a ? (a < 0 ? -c : c) : 0);
+    }
+}
+static inline void dequant_row_32(const int16_t *v, int32_t *dst, int w, uint32_t qf, uint32_t qo)
+{
+    for (int x = 0; x < w; x++) {
+        int a = v[x], m = a < 0 ? -a : a;
+        int32_t c = (int32_t)(((uint32_t)m * qf + qo) >> 2);
+        dst[x] = a ? (a < 0 ? -c : c) : 0;
+    }
+}
+
+typedef struct escratch_s { int16_t *coef; vlc_stream *st; int *coded, *base; uint8_t *qi; } escratch;
+
+// reference path for one slice: bit-serial, straight into the subbands, any coefficient size
+static void dec_slice_ref(vc2_dec *d, int sy, int sx)
+{
+    const int depth = d->pic.depth, nx = d->pic.slices_x, scaler = d->pic.size_scaler;
+    const uint8_t *s = d->slices + d->off[sy * nx + sx] + d->pic.prefix_bytes;
+    int qi = *s++;
+    for (int c = 0; c < 3; c++) {
+        plane_t *p = &d->pl[c];
+        size_t len = (size_t)*s++ * scaler;
+        sbr b = { s, s + len, 0, 0 };
+        for (int l = 0; l <= depth; l++) {
+            int x0 = p->xs[l][sx], w = p->xs[l][sx + 1] - x0, y0 = p->ys[l][sy], h = p->ys[l][sy + 1] - y0;
+            ptrdiff_t st = p->g.bw[l];
+            size_t esz = band16(d, l) ? 2 : 4;
+            if (w <= 0 || h <= 0) continue;
             for (int o = l ? 1 : 0; o < (l ? 4 : 1); o++) {
                 int q = qi - d->pic.qm[l][o];
                 q = q < 0 ? 0 : q >= VC2_NQ ? VC2_NQ - 1 : q;
-                qf[l][o] = vc2_qf[q]; qo[l][o] = vc2_qo[q];
+                for (int y = y0; y < y0 + h; y++) memset((uint8_t *)p->band[l][o] + ((size_t)y * st + x0) * esz, 0, w * esz);
+                if (b.p >= b.end + 8) continue;
+                if (band16(d, l)) dec_band_16(&b, (int16_t *)p->band[l][o] + (size_t)y0 * st + x0, st, w, h, vc2_qf[q], vc2_qo[q]);
+                else dec_band_32(&b, (int32_t *)p->band[l][o] + (size_t)y0 * st + x0, st, w, h, vc2_qf[q], vc2_qo[q]);
             }
+        }
+        s += len;
+    }
+}
+
+// Decode slices [sx0, sx1) of slice row sy: all their bit streams into linear buffers first, then
+// dequantisation subband row by subband row, so the subband memory is written in order.
+static void dec_slices(vc2_dec *d, int sy, int sx0, int sx1, escratch *es)
+{
+    const int depth = d->pic.depth, nx = d->pic.slices_x, scaler = d->pic.size_scaler, ns = sx1 - sx0;
+    if (d->ref_entropy) {
+        for (int sx = sx0; sx < sx1; sx++) dec_slice_ref(d, sy, sx);
+        return;
+    }
+    const int per = d->max_coefs + 32; // buffer entries per slice component
+    int nst = 0;
+    double tp0 = now();
+    for (int sx = sx0; sx < sx1; sx++) {
+        const uint8_t *s = d->slices + d->off[sy * nx + sx] + d->pic.prefix_bytes;
+        es->qi[sx - sx0] = *s++;
         for (int c = 0; c < 3; c++) {
-            plane_t *p = &d->pl[c];
+            const plane_t *p = &d->pl[c];
             size_t len = (size_t)*s++ * scaler;
-            sbr b = { s, s + len, 0, 0 };
-            for (int l = 0; l <= depth && b.p < b.end + 8; l++) {
-                int x0 = p->xs[l][sx], w = p->xs[l][sx + 1] - x0, y0 = p->ys[l][sy], h = p->ys[l][sy + 1] - y0;
-                ptrdiff_t st = p->g.bw[l];
-                if (w <= 0 || h <= 0) continue;
-                for (int o = l ? 1 : 0; o < (l ? 4 : 1) && b.p < b.end + 8; o++) {
-                    if (band16(d, l)) dec_band_16(&b, (int16_t *)p->band[l][o] + (size_t)y0 * st + x0, st, w, h, qf[l][o], qo[l][o]);
-                    else dec_band_32(&b, (int32_t *)p->band[l][o] + (size_t)y0 * st + x0, st, w, h, qf[l][o], qo[l][o]);
-                }
-            }
+            int n = 0, k = (sx - sx0) * 3 + c;
+            for (int l = 0; l <= depth; l++) n += (l ? 3 : 1) * (p->xs[l][sx + 1] - p->xs[l][sx]) * (p->ys[l][sy + 1] - p->ys[l][sy]);
+            int16_t *out = es->coef + (size_t)k * per;
+            memset(out, 0, (size_t)n * 2);
+            es->st[nst++] = (vlc_stream){ s, 0, len * 8, out, 0, n, &es->coded[k] };
             s += len;
         }
     }
+    PROF(0, tp0);
+    double tp1 = now();
+    vlc_decode_all(es->st, nst);
+    PROF(1, tp1);
+    double tp2 = now();
+    int bad = 0;
+    for (int k = 0; k < ns * 3; k++) bad |= es->coded[k] < 0;
+    if (bad) { // a coefficient beyond 16 bits (very fine quantiser): take the reference path
+        for (int sx = sx0; sx < sx1; sx++) dec_slice_ref(d, sy, sx);
+        return;
+    }
+    for (int c = 0; c < 3; c++) {
+        plane_t *p = &d->pl[c];
+        int *base = es->base; // start of the current band in each slice's buffer
+        memset(base, 0, ns * sizeof *base);
+        for (int l = 0; l <= depth; l++) {
+            const int *xs = p->xs[l];
+            int y0 = p->ys[l][sy], h = p->ys[l][sy + 1] - y0, is16 = band16(d, l);
+            ptrdiff_t st = p->g.bw[l];
+            for (int o = l ? 1 : 0; o < (l ? 4 : 1); o++) {
+                for (int r = 0; r < h; r++)
+                    for (int sx = sx0; sx < sx1; sx++) {
+                        int w = xs[sx + 1] - xs[sx], k = (sx - sx0) * 3 + c, idx = base[sx - sx0] + r * w;
+                        if (w <= 0) continue;
+                        int q = es->qi[sx - sx0] - d->pic.qm[l][o];
+                        q = q < 0 ? 0 : q >= VC2_NQ ? VC2_NQ - 1 : q;
+                        const int16_t *v = es->coef + (size_t)k * per + idx;
+                        if (is16) {
+                            int16_t *dst = (int16_t *)p->band[l][o] + (size_t)(y0 + r) * st + xs[sx];
+                            if (idx >= es->coded[k]) memset(dst, 0, w * 2);
+                            else dequant_row_16(v, dst, w, vc2_qf[q], vc2_qo[q]);
+                        } else {
+                            int32_t *dst = (int32_t *)p->band[l][o] + (size_t)(y0 + r) * st + xs[sx];
+                            if (idx >= es->coded[k]) memset(dst, 0, w * 4);
+                            else dequant_row_32(v, dst, w, vc2_qf[q], vc2_qo[q]);
+                        }
+                    }
+                for (int sx = sx0; sx < sx1; sx++) base[sx - sx0] += h * (xs[sx + 1] - xs[sx]);
+            }
+        }
+    }
+    PROF(2, tp2);
 }
 
 static void entropy_job(void *arg, int job, int thread)
 {
-    (void)thread;
     vc2_dec *d = arg;
     const int nx = d->pic.slices_x, seg = d->seg_n;
     int sy = d->seg_sy + job / seg, i = job % seg;
-    dec_slices(d, sy, nx * i / seg, nx * (i + 1) / seg);
+    dec_slices(d, sy, nx * i / seg, nx * (i + 1) / seg, &d->es[thread]);
 }
 
 // --- inverse wavelet --------------------------------------------------------------------------------------
@@ -242,7 +425,7 @@ static void free_planes(vc2_dec *d)
         free(p->pix);
         memset(p, 0, sizeof *p);
     }
-    for (int i = 0; d->scratch && i < d->threads; i++) { free(d->scratch[i]); d->scratch[i] = 0; }
+    for (int i = 0; d->scratch && i < d->threads; i++) { free(d->scratch[i]); d->scratch[i] = 0; free(d->es[i].coef); free(d->es[i].st); free(d->es[i].coded); free(d->es[i].base); free(d->es[i].qi); memset(&d->es[i], 0, sizeof d->es[i]); }
     free(d->off); d->off = 0;
 }
 
@@ -277,7 +460,18 @@ static int configure(vc2_dec *d)
         p->pix = vc2_alloc((size_t)p->pstride * h * 2);
         if (p->g.pw > maxw) maxw = p->g.pw;
     }
-    for (int i = 0; i < d->threads; i++) d->scratch[i] = vc2_alloc(vc2_strip_scratch_32(maxw / 2, 16) * 4);
+    d->max_coefs = 0;
+    for (int l = 0; l <= pc->depth; l++)
+        d->max_coefs += (l ? 3 : 1) * (d->pl[0].g.bw[l] / pc->slices_x + 1) * (d->pl[0].g.bh[l] / pc->slices_y + 1);
+    d->ref_entropy = !!getenv("VC2_REF_ENTROPY");
+    for (int i = 0; i < d->threads; i++) {
+        d->scratch[i] = vc2_alloc(vc2_strip_scratch_32(maxw / 2, 16) * 4);
+        d->es[i].coef = vc2_alloc((size_t)(d->max_coefs + 32) * 3 * pc->slices_x * 2);
+        d->es[i].st = malloc((size_t)3 * pc->slices_x * sizeof(vlc_stream));
+        d->es[i].coded = malloc((size_t)3 * pc->slices_x * sizeof(int));
+        d->es[i].base = malloc((size_t)pc->slices_x * sizeof(int));
+        d->es[i].qi = malloc(pc->slices_x);
+    }
     d->off = malloc(((size_t)pc->slices_x * pc->slices_y + 1) * sizeof *d->off);
     d->configured = 1;
     return 0;
@@ -291,14 +485,19 @@ vc2_dec *vc2_dec_new(int threads, const int *cpus)
     d->threads = threads < 1 ? 1 : threads > 64 ? 64 : threads;
     d->pool = vc2_pool_new(d->threads, cpus);
     d->scratch = calloc(d->threads, sizeof *d->scratch);
+    d->es = calloc(d->threads, sizeof *d->es);
+    vlc_lut_init();
     return d;
 }
 void vc2_dec_free(vc2_dec *d)
 {
     if (!d) return;
+#ifdef VC2_PROF
+    fprintf(stderr, "entropy: setup %.3f s, vlc %.3f s, dequant %.3f s\n", prof_t[0], prof_t[1], prof_t[2]);
+#endif
     vc2_pool_free(d->pool);
     free_planes(d);
-    free(d->scratch); free(d->tasks);
+    free(d->scratch); free(d->es); free(d->tasks);
     free(d);
 }
 const vc2_seq *vc2_dec_seq(const vc2_dec *d) { return &d->seq; }

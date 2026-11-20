@@ -10,7 +10,7 @@ ifeq ($(ARCH),aarch64)
 CFLAGS += -mcpu=native
 endif
 LIB := $(BUILD)/vc2_common.o $(BUILD)/vc2_dec.o $(BUILD)/vc2_enc.o
-TOOLS := $(BUILD)/vc2enc $(BUILD)/vc2dec $(BUILD)/psnr
+TOOLS := $(BUILD)/vc2enc $(BUILD)/vc2dec $(BUILD)/psnr $(BUILD)/vc2bench
 
 all: $(TOOLS)
 $(BUILD):
