@@ -42,7 +42,7 @@ int main(int argc, char **argv)
         else if (!out) out = a;
     }
     if (!in || !out) {
-        fprintf(stderr, "usage: vc2enc [-s WxH] [--bpp 3] [--wavelet 1] [--depth 4] [--slice 64x16] [--rc-rows 0] [--tail 0.15]\n"
+        fprintf(stderr, "usage: vc2enc [-s WxH] [--bpp 3] [--wavelet 1] [--depth 4] [--slice 128x16] [--rc-rows 0] [--tail 0.2]\n"
                         "              [--fps 50] [--threads 1] [--chroma 1] [--loops 1] [--qm list] [--q N] [--no-truncate] in.yuv out.vc2\n"
                         "  wavelets: 0 DD 9,7  1 LeGall 5,3  2 DD 13,7  3 Haar  4 Haar (shift)  6 Daubechies 9,7\n");
         return 2;

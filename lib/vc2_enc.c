@@ -59,8 +59,8 @@ void vc2_enc_defaults(vc2_enc_cfg *c, int width, int height)
     c->width = width; c->height = height; c->chroma = 1; c->bit_depth = 10;
     c->fr_num = 50; c->fr_den = 1;
     c->wavelet = VC2_WL_LEGALL5_3; c->depth = 4;
-    c->slice_w = 64; c->slice_h = 16;
-    c->bpp = 3; c->tail_lambda = 0.15; c->threads = 1;
+    c->slice_w = 128; c->slice_h = 16;
+    c->bpp = 3; c->tail_lambda = 0.2; c->threads = 1;
 }
 
 vc2_enc *vc2_enc_new(const vc2_enc_cfg *c)
@@ -225,21 +225,25 @@ static void count_row(const int32_t *c, int w, float r16, uint32_t *bits, uint32
     }
 }
 // quantised signed values of one row
-static inline __attribute__((always_inline)) void quant_row_w(const int32_t *c, int w, float r16, int32_t *v)
+static inline __attribute__((always_inline)) int quant_row_w(const int32_t *c, int w, float r16, int32_t *v)
 {
+    int32_t any = 0;
     for (int x = 0; x < w; x++) {
         int32_t a = c[x] < 0 ? -c[x] : c[x], q = (int32_t)((float)(a << 2) * r16) >> 4;
         v[x] = c[x] < 0 ? -q : q;
+        any |= q;
     }
+    return any != 0;
 }
-static void quant_row(const int32_t *c, int w, float r16, int32_t *v)
+// returns 0 if the whole row quantises to zero
+static int quant_row(const int32_t *c, int w, float r16, int32_t *v)
 {
     switch (w) {
-    case 8: quant_row_w(c, 8, r16, v); break;
-    case 16: quant_row_w(c, 16, r16, v); break;
-    case 32: quant_row_w(c, 32, r16, v); break;
-    case 64: quant_row_w(c, 64, r16, v); break;
-    default: quant_row_w(c, w, r16, v);
+    case 8: return quant_row_w(c, 8, r16, v);
+    case 16: return quant_row_w(c, 16, r16, v);
+    case 32: return quant_row_w(c, 32, r16, v);
+    case 64: return quant_row_w(c, 64, r16, v);
+    default: return quant_row_w(c, w, r16, v);
     }
 }
 
@@ -407,7 +411,9 @@ static void write_job(void *arg, int sy, int thread)
                     for (int sx = 0; sx < nx; sx++) {
                         int si = sy * nx + sx, q = e->sq[si] - e->qm[l][o];
                         if (n >= e->cut[e->sq[si]][si * 3 + c]) continue;
-                        quant_row(row + xs[sx], xs[sx + 1] - xs[sx], e->r16[q < 0 ? 0 : q], gc[c] + per_slice * sx + off);
+                        int32_t *gv = gc[c] + per_slice * sx + off;
+                        // an all-zero row is marked in its spare last entry and written as a run of ones
+                        gv[xs[sx + 1] - xs[sx]] = quant_row(row + xs[sx], xs[sx + 1] - xs[sx], e->r16[q < 0 ? 0 : q], gv);
                     }
                     off += (p->g.bw[l] + nx - 1) / nx + 1;
                 }
@@ -425,7 +431,11 @@ static void write_job(void *arg, int sy, int thread)
             sbw b = { o, 0, 0 };
             for (int l = 0; l <= depth && n < cuts[c]; l++) {
                 int w = p->xs[l][sx + 1] - p->xs[l][sx], adv = (p->g.bw[l] + nx - 1) / nx + 1;
-                for (int k = (l ? 3 : 1) * (p->ys[l][sy + 1] - p->ys[l][sy]); k > 0 && n < cuts[c]; k--, n++, vq += adv)
+                for (int k = (l ? 3 : 1) * (p->ys[l][sy + 1] - p->ys[l][sy]); k > 0 && n < cuts[c]; k--, n++, vq += adv) {
+                    if (!vq[w]) {
+                        for (int x = w; x > 0; x -= 32) put(&b, x >= 32 ? 0xffffffffu : (1u << x) - 1, x >= 32 ? 32 : x);
+                        continue;
+                    }
                     for (int x = 0; x < w; x++) {
                         uint32_t i = (uint32_t)(vq[x] + VLC_R);
                         if (__builtin_expect(i < 2 * VLC_R, 1)) { put(&b, vlc_code[i], vlc_len[i]); continue; }
@@ -434,6 +444,7 @@ static void write_job(void *arg, int sy, int thread)
                         for (int j = kk - 1; j >= 0; j--) put(&b, (v >> j) & 1, 2);
                         put(&b, 2 | (vq[x] < 0), 2);
                     }
+                }
             }
             // the rest of the counted size, and the padding, are ones (zeros for the decoder)
             put(&b, 0x7f, 7);
@@ -476,7 +487,7 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
     e->last_q = uq[0];
     // refinement: slices one index lower while the unit's budget lasts. The lower index is counted only for as
     // many slice rows (spread over the unit) as the remaining budget is likely to pay for.
-    for (int r0 = 0, u = 0; r0 < e->ny && e->c.fixed_q <= 0; r0 += unit, u++) {
+    for (int r0 = 0, u = 0; r0 < e->ny; r0 += unit, u++) {
         int r1 = r0 + unit < e->ny ? r0 + unit : e->ny, q = uq[u], n = r1 - r0, lim = 255 * e->scaler;
         size_t budget = (size_t)(frame_budget * n / e->ny), tot = total_size(e, q, r0, r1, e->scaler, 0);
         int step = (int)(n * 0.6180339887) | 1, order[4096];
@@ -484,7 +495,7 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
         for (int i = 0, k = 0; i < n; i++, k = (k + step) % n) order[i] = r0 + k;
         for (int i = 0; i < n * e->nx; i++) e->sq[r0 * e->nx + i] = q;
         const size_t small = tot / ((size_t)n * e->nx) / 8 + 1; // an upgrade costs about this much at least
-        for (int done = 0; q > 0 && done < n && tot + small < budget;) {
+        for (int done = 0; q > 0 && e->c.fixed_q <= 0 && done < n && tot + small < budget;) {
             int batch = (int)((budget - tot) / (tot / (double)n * 0.12)) + 2;
             if (batch > n - done) batch = n - done;
             eval_q(e, q - 1, 0, 0, order + done, batch);

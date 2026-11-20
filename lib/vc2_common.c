@@ -264,7 +264,7 @@ struct vc2_pool {
     pthread_cond_t cv, done_cv;
     vc2_job_fn fn;
     void *arg;
-    int njobs, gen, running;
+    int njobs, gen, running, each;
     atomic_int next;
     const int *cpus;
     int cpu_list[64];
@@ -273,6 +273,10 @@ struct worker_arg { vc2_pool *p; int id; };
 
 static void work(vc2_pool *p, int id)
 {
+    if (p->each) { // one job per thread: job number = thread number
+        if (id < p->njobs) p->fn(p->arg, id, id);
+        return;
+    }
     for (;;) {
         int j = atomic_fetch_add(&p->next, 1);
         if (j >= p->njobs) break;
@@ -332,10 +336,17 @@ void vc2_pool_free(vc2_pool *p)
     free(p);
 }
 int vc2_pool_threads(const vc2_pool *p) { return p->n; }
+// run job i on thread i (n <= threads): for work shares sized per core
+void vc2_pool_run_each(vc2_pool *p, vc2_job_fn fn, void *arg, int n)
+{
+    p->each = 1;
+    vc2_pool_run(p, fn, arg, n > p->n ? p->n : n);
+    p->each = 0;
+}
 void vc2_pool_run(vc2_pool *p, vc2_job_fn fn, void *arg, int n)
 {
     if (n <= 0) return;
-    if (p->n == 1 || n == 1) {
+    if (p->n == 1 || (n == 1 && !p->each)) {
         for (int j = 0; j < n; j++) fn(arg, j, 0);
         return;
     }

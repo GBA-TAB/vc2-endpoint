@@ -4,6 +4,8 @@
 //   --subframe K   feed each frame in K equal parts; with --fps the parts arrive spread over the frame period
 //                  (constant bit rate), and the latency is counted from the arrival of the last byte
 //   --out f.yuv    write the decoded frames of the first pass
+//   --weights a,b  relative speed of each thread's core (sizes the bands of slice rows)
+//   --nv20         decode into the display's packed NV20 layout (checked against the planar output first)
 #define _GNU_SOURCE
 #include "../lib/vc2.h"
 #include <sched.h>
@@ -23,8 +25,11 @@ static void sleep_until(double t)
 
 int main(int argc, char **argv)
 {
-    int frames = 300, threads = 1, sub = 0, cpus[64], ncpu = 0;
+    int frames = 300, threads = 1, sub = 0, cpus[64], ncpu = 0, nv20 = 0;
     double fps = 0;
+    float weights[64];
+    int nw = 0;
+    for (int i = 0; i < 64; i++) weights[i] = 1;
     const char *in = 0, *out = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
@@ -33,6 +38,12 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--fps")) { fps = atof(v); i++; }
         else if (!strcmp(a, "--subframe")) { sub = atoi(v); i++; }
         else if (!strcmp(a, "--out")) { out = v; i++; }
+        else if (!strcmp(a, "--nv20")) nv20 = 1;
+        else if (!strcmp(a, "--weights")) {
+            char *s = strdup(v);
+            for (char *t = strtok(s, ","); t && nw < 64; t = strtok(0, ",")) weights[nw++] = (float)atof(t);
+            i++;
+        }
         else if (!strcmp(a, "--cpus")) {
             char *s = strdup(v);
             for (char *t = strtok(s, ","); t && ncpu < 64; t = strtok(0, ",")) cpus[ncpu++] = atoi(t);
@@ -58,10 +69,29 @@ int main(int argc, char **argv)
         sched_setaffinity(0, sizeof set, &set);
     }
     vc2_dec *d = vc2_dec_new(threads, ncpu ? cpus : 0);
+    if (nw) vc2_dec_set_weights(d, weights);
     FILE *fo = out ? fopen(out, "wb") : 0;
     vc2_frame f;
     for (int i = 0; i < naus && i < 8; i++) // warm up: buffers, page faults
         if (vc2_dec_decode(d, buf + au_off[i], au_len[i], &f)) { fprintf(stderr, "decode error\n"); return 1; }
+    if (nv20) { // decode into the display layout instead; check the first frame against the planar output
+        size_t pitch = (size_t)f.width * 10 / 8, sz = pitch * f.height;
+        uint8_t *y = malloc(2 * sz + 8), *ref = calloc(1, 2 * sz + 8);
+        if (vc2_dec_decode(d, buf, au_len[0], &f)) return 1;
+        for (int r = 0; r < f.height; r++)
+            for (int x = 0; x < f.width; x += 4) {
+                const uint16_t *yp = f.plane[0] + (size_t)r * f.stride[0] + x, *u = f.plane[1] + (size_t)r * f.stride[1] + x / 2,
+                               *v = f.plane[2] + (size_t)r * f.stride[2] + x / 2;
+                uint64_t a = (uint64_t)yp[0] | (uint64_t)yp[1] << 10 | (uint64_t)yp[2] << 20 | (uint64_t)yp[3] << 30;
+                uint64_t c = (uint64_t)u[0] | (uint64_t)v[0] << 10 | (uint64_t)u[1] << 20 | (uint64_t)v[1] << 30;
+                memcpy(ref + r * pitch + x / 4 * 5, &a, 5);
+                memcpy(ref + sz + r * pitch + x / 4 * 5, &c, 5);
+            }
+        vc2_dec_set_nv20(d, y, y + sz, pitch);
+        if (vc2_dec_decode(d, buf, au_len[0], &f)) return 1;
+        printf("NV20 output %s\n", memcmp(y, ref, 2 * sz) ? "DIFFERS from the planar output" : "matches the planar output");
+        free(ref);
+    }
     double t_start = now(), c_start = cpu(), lat_sum = 0, lat_max = 0, tp[2] = { 0, 0 }, first_sum = 0, dec_sum = 0;
     int late = 0;
     for (int i = 0; i < frames; i++) {
@@ -94,7 +124,7 @@ int main(int argc, char **argv)
         if (t_first) first_sum += t_first - t0;
         vc2_dec_times(d, t);
         tp[0] += t[0]; tp[1] += t[1];
-        if (fo && i < naus)
+        if (fo && i < naus && !nv20)
             for (int c = 0; c < 3; c++) {
                 int w = c && f.chroma ? f.width / 2 : f.width, h = c && f.chroma == 2 ? f.height / 2 : f.height;
                 for (int y = 0; y < h; y++) fwrite(f.plane[c] + (size_t)y * f.stride[c], 2, w, fo);

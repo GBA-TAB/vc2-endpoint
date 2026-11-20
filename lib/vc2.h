@@ -56,6 +56,9 @@ int vc2_dec_decode(vc2_dec *d, const uint8_t *au, size_t len, vc2_frame *out);
 // inverse wavelet as far as the data allows. Returns the number of finished output lines (== height when done).
 int vc2_dec_begin(vc2_dec *d, const uint8_t *au, size_t len_now, vc2_frame *out);
 int vc2_dec_feed(vc2_dec *d, size_t len_now);
+// Relative speed of each thread's core (default: all equal). A whole-frame decode gives every thread a band
+// of slice rows in proportion, e.g. 1,1,1,0.27,0.27 for three A76 and two A55 cores of an RK3588.
+void vc2_dec_set_weights(vc2_dec *d, const float *w);
 const vc2_seq *vc2_dec_seq(const vc2_dec *d);
 const vc2_pic *vc2_dec_pic(const vc2_dec *d);
 // Per-phase time of the last frame in seconds (summed over calls): [0] entropy decode, [1] inverse wavelet.

@@ -41,6 +41,7 @@ typedef void (*vc2_job_fn)(void *arg, int job, int thread);
 vc2_pool *vc2_pool_new(int threads, const int *cpus);
 void vc2_pool_free(vc2_pool *p);
 void vc2_pool_run(vc2_pool *p, vc2_job_fn fn, void *arg, int n);
+void vc2_pool_run_each(vc2_pool *p, vc2_job_fn fn, void *arg, int n);
 int vc2_pool_threads(const vc2_pool *p);
 
 static inline void *vc2_alloc(size_t n) { void *p = 0; if (posix_memalign(&p, 64, n + 64)) return 0; memset(p, 0, n + 64); return p; }

@@ -23,4 +23,9 @@ $(BUILD)/%: tools/%.c $(BUILD)/libvc2.a
 	$(CC) $(CFLAGS) $< -o $@ $(BUILD)/libvc2.a -lpthread -lm
 clean:
 	rm -rf $(BUILD)
-.PHONY: all clean
+.PHONY: all clean player
+
+# the DRM player (Firefly): make player BUILD=...
+player: $(BUILD)/vc2play
+$(BUILD)/vc2play: player/vc2play.c $(BUILD)/libvc2.a
+	$(CC) $(CFLAGS) $< -o $@ $(BUILD)/libvc2.a $(shell pkg-config --cflags --libs libdrm) -lpthread -lm

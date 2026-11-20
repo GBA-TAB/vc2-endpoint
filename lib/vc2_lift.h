@@ -86,13 +86,15 @@ typedef struct {
     const vc2_wavelet *wl;
     int w, h;              // band size
     const T *band[4];      // LL, HL, LH, HH
+    int bmask[4];          // the bands are ring buffers of rows: row i lives at (i & mask)
     ptrdiff_t bstride;
     int out_kind;
-    void *out;             // next level's LL (2w x 2h) or the picture plane
+    void *out;             // next level's LL (2w x 2h) or picture rows; also a ring (omask)
+    int omask;
     ptrdiff_t ostride;     // in samples
-    int ow, oh;            // picture crop (VC2_OUT_PIX)
+    int ow;                // picture width (VC2_OUT_PIX)
+    int oy0, oy1;          // VC2_OUT_PIX: only these output rows are written
     int pix_off, pix_max;
-    uint8_t *nv20;         // VC2_OUT_PIX: write packed NV20 rows here instead (see vc2_dec.c)
 } FN(vc2_level);
 
 static inline int FN(vc2_strip_halfw)(int w) { return (w + 2 * VC2_G + 7) & ~7; }
@@ -123,7 +125,7 @@ static __attribute__((unused)) void FN(vc2_synth_strip)(const FN(vc2_level) *L, 
     T *tb[2] = { tmp, tmp + (size_t)(y1 - y0 + 12) * rw };
     int written[2] = { 0, 0 };
 #define ROW(which, half, i) (written[which] ? tb[which] + (size_t)((i) - base) * rw + ((half) ? hw + VC2_G : VC2_G) \
-                                             : L->band[(which) * 2 + (half)] + (size_t)(i) * L->bstride)
+                                             : L->band[(which) * 2 + (half)] + (size_t)((i) & L->bmask[(which) * 2 + (half)]) * L->bstride)
 #define CLAMP(i) ((i) < 0 ? 0 : (i) >= h ? h - 1 : (i))
     for (int j = 0; j < ns; j++) {
         const vc2_step *s = &wl->st[j];
@@ -152,14 +154,14 @@ static void FN(vc2_emit_row)(const FN(vc2_level) *L, int oy, const T *lo, const 
 {
     const int w = L->w, sh = L->wl->shift, r = sh ? 1 : 0;
     if (L->out_kind == VC2_OUT_I32) {
-        int32_t *o = (int32_t *)L->out + (size_t)oy * L->ostride;
+        int32_t *o = (int32_t *)L->out + (size_t)(oy & L->omask) * L->ostride;
         for (int x = 0; x < w; x++) { o[2 * x] = (lo[x] + r) >> sh; o[2 * x + 1] = (hi[x] + r) >> sh; }
     } else if (L->out_kind == VC2_OUT_I16) {
-        int16_t *o = (int16_t *)L->out + (size_t)oy * L->ostride;
+        int16_t *o = (int16_t *)L->out + (size_t)(oy & L->omask) * L->ostride;
         for (int x = 0; x < w; x++) { o[2 * x] = (lo[x] + r) >> sh; o[2 * x + 1] = (hi[x] + r) >> sh; }
     } else {
-        if (oy >= L->oh) return;
-        uint16_t *o = (uint16_t *)L->out + (size_t)oy * L->ostride;
+        if (oy < L->oy0 || oy >= L->oy1) return;
+        uint16_t *o = (uint16_t *)L->out + (size_t)(oy & L->omask) * L->ostride;
         const int off = L->pix_off, max = L->pix_max, n = L->ow / 2;
         for (int x = 0; x < n; x++) {
             int a = ((lo[x] + r) >> sh) + off, b = ((hi[x] + r) >> sh) + off;
