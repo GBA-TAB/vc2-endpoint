@@ -54,6 +54,8 @@ typedef struct {          // one cascade
     int *coded, *base;
     uint8_t *qi;
     uint16_t *line[3];    // NV20 staging rings
+    int ll0[3], ll1[3];   // rows of the last level's LL this cascade writes (all of them, except on the GPU path)
+    int gblk[3], gcl0[3], gcl1[3]; // GPU path: next block to launch per unit, rows handed over per component
     double t[3];
 } casc_t;
 
@@ -77,6 +79,8 @@ struct vc2_dec {
     double t[2];
     uint8_t *nv20_y, *nv20_c;
     ptrdiff_t nv20_pitch;
+    struct dec_gpu *gpu;       // the last level on a GPU (vc2_dec_gpu.h)
+    int gpu_on;
 };
 
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -389,6 +393,8 @@ static void pack_c(uint8_t *dst, const uint16_t *cb, const uint16_t *cr, int cw)
     }
 }
 
+#include "vc2_dec_gpu.h"
+
 // --- inverse wavelet --------------------------------------------------------------------------------------
 static void synth_strip(vc2_dec *d, casc_t *k, int c, int l, int y0, int y1)
 {
@@ -396,7 +402,8 @@ static void synth_strip(vc2_dec *d, casc_t *k, int c, int l, int y0, int y1)
     const int depth = d->pic.depth, last = l == depth, nv20 = last && d->nv20_y;
     const void *in_ll = l == 1 ? k->band[c][0][0] : k->ll[c][l - 1];
     const int in_mask = (l == 1 ? p->brows[0] : p->lrows[l - 1]) - 1, bm = p->brows[l] - 1;
-    const int lines0 = c && d->seq.chroma == 2 ? k->line0 / 2 : k->line0, lines1 = c && d->seq.chroma == 2 ? (k->line1 + 1) / 2 : k->line1;
+    int lines0 = c && d->seq.chroma == 2 ? k->line0 / 2 : k->line0, lines1 = c && d->seq.chroma == 2 ? (k->line1 + 1) / 2 : k->line1;
+    if (!last) { lines0 = k->ll0[c]; lines1 = k->ll1[c]; } // a deep level: the row filter of its 16-bit output
     void *out = last ? (nv20 ? (void *)k->line[c] : (void *)p->pix) : k->ll[c][l];
     int omask = last ? (nv20 ? LINE_RING - 1 : -1) : p->lrows[l] - 1;
     ptrdiff_t ostride = last ? (nv20 ? p->g.pw : p->pstride) : 2 * p->g.bw[l];
@@ -435,6 +442,14 @@ static void synth_advance(vc2_dec *d, casc_t *k)
 {
     const int depth = d->pic.depth;
     for (int l = 1; l <= depth; l++) {
+        if (l == depth && d->gpu_on) { // the GPU runs this level: only note how far it could go
+            for (int c = 0; c < 3; c++) {
+                int lim = synth_limit(d, k, c, l);
+                if (lim > k->syn_done[c][l]) k->syn_done[c][l] = lim;
+            }
+            gpu_progress(d, k, 0);
+            break;
+        }
         const int pair = l == depth && d->nv20_y; // Cb and Cr strip by strip, for the interleaved output
         for (int c = 0; c < 3; c++) {
             const comp_t *p = &d->pl[c];
@@ -455,6 +470,7 @@ static void synth_advance(vc2_dec *d, casc_t *k)
 static void casc_start(vc2_dec *d, casc_t *k, int sy, int line0, int line1)
 {
     k->sr_done = sy; k->line0 = line0; k->line1 = line1;
+    for (int c = 0; c < 3; c++) { k->ll0[c] = 0; k->ll1[c] = INT_MAX; }
     for (int c = 0; c < 3; c++)
         for (int l = 1; l <= d->pic.depth; l++) k->syn_done[c][l] = d->pl[c].ys[l][sy];
 }
@@ -504,12 +520,15 @@ static void chunk_job(void *arg, int job, int thread)
     int ra = r0;
     while (ra > 0 && clean_line(d, ra) > line0) ra--;
     casc_start(d, k, ra, line0, line1 < d->seq.height ? line1 : d->seq.height);
+    if (d->gpu_on) gpu_casc_start(d, k, r0, r1);
     while (k->sr_done < ny && casc_lines(d, k) < k->line1) casc_row(d, k);
+    if (d->gpu_on) gpu_progress(d, k, 1);
 }
 
 // --- setup --------------------------------------------------------------------------------------------------
 static void free_all(vc2_dec *d)
 {
+    gpu_unconfigure(d);
     for (int c = 0; c < 3; c++) {
         comp_t *p = &d->pl[c];
         for (int l = 0; l < NL; l++) { free(p->xs[l]); free(p->ys[l]); }
@@ -604,6 +623,7 @@ static int configure(vc2_dec *d)
         k->qi = malloc(pc->slices_x);
     }
     d->off = malloc(((size_t)pc->slices_x * pc->slices_y + 1) * sizeof *d->off);
+    gpu_configure(d);
     d->configured = 1;
     return 0;
 }
@@ -627,6 +647,7 @@ void vc2_dec_free(vc2_dec *d)
 #endif
     vc2_pool_free(d->pool);
     free_all(d);
+    free(d->gpu);
     free(d->cs);
     free(d);
 }
@@ -669,6 +690,7 @@ int vc2_dec_begin(vc2_dec *d, const uint8_t *au, size_t len, vc2_frame *out)
         out->width = d->seq.width; out->height = d->seq.height; out->chroma = d->seq.chroma; out->bit_depth = d->seq.bit_depth;
         for (int c = 0; c < 3; c++) { out->plane[c] = d->pl[c].pix; out->stride[c] = d->pl[c].pstride; }
     }
+    if (d->gpu_on && gpu_begin(d, out)) return -1;
     return 0;
 }
 
@@ -694,6 +716,11 @@ int vc2_dec_feed(vc2_dec *d, size_t len)
     int rows = index_slices(d, len);
     while (k->sr_done < rows) casc_row(d, k);
     d->t[0] = k->t[0]; d->t[1] = k->t[1];
+    if (d->gpu_on) { // the lines are there when the GPU has done the whole frame
+        if (casc_lines(d, k) < d->seq.height) return 0;
+        gpu_progress(d, k, 1);
+        if (gpu_finish(d)) return -1;
+    }
     return casc_lines(d, k);
 }
 
@@ -707,6 +734,7 @@ int vc2_dec_decode(vc2_dec *d, const uint8_t *au, size_t len, vc2_frame *out)
     for (int i = 0; i < d->nchunks; i++) { d->chunk_row[i] = (int)(d->pic.slices_y * acc / wsum + 0.5f); acc += d->weight[i]; }
     d->chunk_row[d->nchunks] = d->pic.slices_y;
     vc2_pool_run_each(d->pool, chunk_job, d, d->nchunks);
+    if (d->gpu_on && gpu_finish(d)) return -1;
     for (int i = 0; i < d->threads; i++) { d->t[0] += d->cs[i].t[0]; d->t[1] += d->cs[i].t[1]; }
     return 0;
 }

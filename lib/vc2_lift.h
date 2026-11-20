@@ -93,7 +93,7 @@ typedef struct {
     int omask;
     ptrdiff_t ostride;     // in samples
     int ow;                // picture width (VC2_OUT_PIX)
-    int oy0, oy1;          // VC2_OUT_PIX: only these output rows are written
+    int oy0, oy1;          // VC2_OUT_PIX, VC2_OUT_I16: only these output rows are written
     int pix_off, pix_max;
 } FN(vc2_level);
 
@@ -157,6 +157,7 @@ static void FN(vc2_emit_row)(const FN(vc2_level) *L, int oy, const T *lo, const 
         int32_t *o = (int32_t *)L->out + (size_t)(oy & L->omask) * L->ostride;
         for (int x = 0; x < w; x++) { o[2 * x] = (lo[x] + r) >> sh; o[2 * x + 1] = (hi[x] + r) >> sh; }
     } else if (L->out_kind == VC2_OUT_I16) {
+        if (oy < L->oy0 || oy >= L->oy1) return;
         int16_t *o = (int16_t *)L->out + (size_t)(oy & L->omask) * L->ostride;
         for (int x = 0; x < w; x++) { o[2 * x] = (lo[x] + r) >> sh; o[2 * x + 1] = (hi[x] + r) >> sh; }
     } else {
