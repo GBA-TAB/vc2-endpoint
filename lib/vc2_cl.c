@@ -210,6 +210,7 @@ static vc2_gpu *cl_create(const vc2_gpu_cfg *cfg, vc2_gpu_bufs *bufs)
         bufs->pstride[c] = g->ostride[c];
     }
     bufs->rb = RB;
+    bufs->nv20 = 1;
 
     for (int o = 0; o < 2; o++) {
         char opt[200];

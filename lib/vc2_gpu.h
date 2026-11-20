@@ -22,6 +22,7 @@ typedef struct {
     uint16_t *pix[3];            // planar output, valid after finish()
     ptrdiff_t pstride[3];
     int rb;                      // band rows per block
+    int nv20;                    // the backend writes NV20 itself (else the decoder packs the planar output)
 } vc2_gpu_bufs;
 
 typedef struct {                 // where a frame goes

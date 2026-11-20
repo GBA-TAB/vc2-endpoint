@@ -22,6 +22,7 @@ struct dec_gpu {
     int nblk;
     uint8_t *launched;           // per block
     int nv20;                    // this frame's output
+    int pack;                    // NV20 packed here from the backend's planar output
     int frame_open;
     int fd;                      // NV20 target as a dma-buf (-1 = none)
     size_t y_off, c_off;
@@ -104,8 +105,9 @@ static int gpu_begin(vc2_dec *d, vc2_frame *out)
 {
     struct dec_gpu *G = d->gpu;
     G->nv20 = d->nv20_y || G->fd >= 0;
-    if (G->nv20 && !gpu_nv20_ok(d)) return -1;
-    vc2_gpu_target t = { G->nv20, G->fd, G->y_off, G->c_off, d->nv20_y, d->nv20_c, G->fd >= 0 ? G->pitch : d->nv20_pitch };
+    G->pack = G->nv20 && !G->b.nv20;
+    if (G->pack ? !d->nv20_y : G->nv20 && !gpu_nv20_ok(d)) return -1;
+    vc2_gpu_target t = { G->nv20 && !G->pack, G->fd, G->y_off, G->c_off, d->nv20_y, d->nv20_c, G->fd >= 0 ? G->pitch : d->nv20_pitch };
     if (G->api->begin(G->g, &t)) return -1;
     memset(G->launched, 0, G->nblk);
     G->frame_open = 1;
@@ -185,6 +187,10 @@ static int gpu_finish(vc2_dec *d)
         g = e;
     }
     rc |= G->api->finish(G->g, &G->t_gpu);
+    for (int y = 0; G->pack && !rc && y < d->seq.height; y++) {
+        pack_y(d->nv20_y + (size_t)y * d->nv20_pitch, G->b.pix[0] + (size_t)y * G->b.pstride[0], d->pl[0].g.w);
+        pack_c(d->nv20_c + (size_t)y * d->nv20_pitch, G->b.pix[1] + (size_t)y * G->b.pstride[1], G->b.pix[2] + (size_t)y * G->b.pstride[2], d->pl[1].g.w);
+    }
     return rc ? -1 : 0;
 }
 

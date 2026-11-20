@@ -19,6 +19,12 @@ CFLAGS += -DVC2_OPENCL
 LIB += $(BUILD)/vc2_cl.o
 GPULIBS += -l:libOpenCL.so.1
 endif
+ifneq ($(filter vk,$(GPU)),)
+CFLAGS += -DVC2_VULKAN
+LIB += $(BUILD)/vc2_vk.o
+GPULIBS += -lvulkan
+GLSLC ?= glslc   # or GLSLC="glslangValidator -V"
+endif
 TOOLS := $(BUILD)/vc2enc $(BUILD)/vc2dec $(BUILD)/psnr $(BUILD)/vc2bench
 
 all: $(TOOLS)
@@ -26,6 +32,10 @@ $(BUILD):
 	mkdir -p $(BUILD)
 $(BUILD)/%.o: lib/%.c lib/vc2.h lib/vc2_priv.h lib/vc2_lift.h lib/vc2_gpu.h lib/vc2_dec_gpu.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/vc2_idwt.spv: lib/vc2_idwt.comp | $(BUILD)
+	$(GLSLC) -fshader-stage=compute -O -o $@ $<
+$(BUILD)/vc2_vk.o: lib/vc2_vk.c $(BUILD)/vc2_idwt.spv lib/vc2.h lib/vc2_gpu.h | $(BUILD)
+	$(CC) $(CFLAGS) -DVC2_IDWT_SPV='"$(abspath $(BUILD)/vc2_idwt.spv)"' -c $< -o $@
 $(BUILD)/vc2_cl.o: lib/vc2_cl.c lib/vc2_idwt.cl lib/vc2.h lib/vc2_gpu.h | $(BUILD)
 	$(CC) $(CFLAGS) -DVC2_IDWT_CL='"$(abspath lib/vc2_idwt.cl)"' -c $< -o $@
 $(BUILD)/libvc2.a: $(LIB)

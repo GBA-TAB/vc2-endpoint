@@ -1,0 +1,112 @@
+// Last inverse-wavelet level of the VC-2 decoder as a Vulkan compute shader: the same steps, tiles and edge
+// handling as the OpenCL kernel in vc2_idwt.cl (see there), written without 16-bit types so that it runs on
+// any Vulkan 1.0 device: the buffers are arrays of 32-bit words, the arithmetic is in int, and S() brings a
+// value back to 16 bits wherever the 16-bit lanes of the CPU path and of the OpenCL kernel would have wrapped
+// (before a right shift, and at the end), so the three give the same output for any input.
+// Planar output only (two samples per word); the decoder packs NV20 on the CPU with this backend.
+#version 450
+layout(local_size_x = 16, local_size_y = 1) in;
+layout(constant_id = 0) const int WL = 1;         // 1 = LeGall 5,3; 0 = Deslauriers-Dubuc 9,7
+layout(constant_id = 1) const int PIX_OFF = 512;
+layout(constant_id = 2) const int PIX_MAX = 1023;
+layout(set = 0, binding = 0) readonly buffer CF { uint cf[]; };     // int16 coefficients, two per word
+layout(set = 0, binding = 1) writeonly buffer PIX { uint pix[]; };  // uint16 samples, two per word
+layout(push_constant) uniform PC {
+    ivec4 off[3];   // where LL, HL, LH, HH start in cf (in int16), for Y, Cb, Cr
+    ivec4 bw;       // band widths of Y, Cb, Cr (rows are that far apart)
+    ivec4 oofs;     // output planes: start (in samples, even)
+    ivec4 ostride;  // and row distance (in samples, even)
+    int bh, oh;     // band height; picture rows to write
+    int blk0;       // first block of this dispatch
+} pc;
+const int RB = 16, TW = 4, LANES = 8; // band rows per work-item, column pairs per work-item, band columns it reads
+
+int S(int v) { return (v << 16) >> 16; }
+// LANES coefficients from int16 index i on
+void load(int i, out int v[LANES])
+{
+    const int p = i & 1, w0 = i >> 1;
+    for (int j = 0; j < LANES; j++) {
+        int w = int(cf[w0 + ((j + p) >> 1)]);
+        v[j] = ((j + p) & 1) != 0 ? w >> 16 : S(w);
+    }
+}
+int upd(int l, int h0, int h1) { return l - (S(h0 + h1 + 2) >> 2); } // even -= (odd[i-1] + odd[i] + 2) >> 2
+int pred(int h, int em, int e0, int e1, int e2)
+{
+    if (WL == 1) return h + (S(e0 + e1 + 1) >> 1);                     // odd += (even[i] + even[i+1] + 1) >> 1
+    int s1 = e0 + e1, s2 = em + e2;                                    // odd += (9 (e0 + e1) - (em + e2) + 8) >> 4
+    return h + (S(s1) >> 1) + (S(s1 - s2 + 8 + ((s1 & 1) << 3)) >> 4);
+}
+// even row i of the vertical lifting, the row index clamped
+void evrow(int l, int h, int i, int bw, int bh, out int v[LANES])
+{
+    i = clamp(i, 0, bh - 1);
+    int a[LANES], b[LANES], c[LANES];
+    load(l + i * bw, a); load(h + max(i - 1, 0) * bw, b); load(h + i * bw, c);
+    for (int j = 0; j < LANES; j++) v[j] = upd(a[j], b[j], c[j]);
+}
+// horizontal lifting of one row, then round, offset, clip; writes the tile's 2 TW samples
+void hrow(int lo[LANES], int hi[LANES], bool edge, int jl, int jr, int word)
+{
+    int e[LANES], t[LANES];
+    if (edge) { for (int j = 0; j < LANES; j++) t[j] = hi[clamp(j, jl, jr)]; hi = t; }
+    for (int j = 0; j < LANES; j++) e[j] = upd(lo[j], hi[max(j - 1, 0)], hi[j]);
+    if (edge) { for (int j = 0; j < LANES; j++) t[j] = e[clamp(j, jl, jr)]; e = t; }
+    for (int j = 2; j < 2 + TW; j++) {
+        int o = pred(hi[j], e[j - 1], e[j], e[j + 1], e[min(j + 2, LANES - 1)]);
+        int a = clamp(((S(e[j]) + 1) >> 1) + PIX_OFF, 0, PIX_MAX), b = clamp(((S(o) + 1) >> 1) + PIX_OFF, 0, PIX_MAX);
+        pix[word + j - 2] = uint(a) | (uint(b) << 16);
+    }
+}
+
+void main()
+{
+    // x = tiles of Y, then of Cb, then of Cr; y = blocks of RB band rows
+    const int gx = int(gl_GlobalInvocationID.x), i0 = (int(gl_GlobalInvocationID.y) + pc.blk0) * RB;
+    const int n0 = (pc.bw.x + TW - 1) / TW, n1 = (pc.bw.y + TW - 1) / TW;
+    const int c = gx < n0 ? 0 : gx < n0 + n1 ? 1 : 2;
+    const int bw = pc.bw[c], bh = pc.bh, k0 = (gx - (c == 0 ? 0 : c == 1 ? n0 : n0 + n1)) * TW;
+    if (k0 >= bw || i0 >= bh) return;
+    const int i1 = min(i0 + RB, bh);
+    const int jl = k0 == 0 ? 2 : 0, jr = min(bw + 1 - k0, LANES - 1); // the lanes of columns 0 and bw - 1
+    const bool edge = k0 == 0 || bw + 1 - k0 < LANES - 1;
+    const int LA = WL == 1 ? 1 : 2; // rows the second lifting step looks ahead
+    const ivec4 off = pc.off[c] + (k0 - 2);
+    int h0[2][LANES], h1[2][LANES], em1[2][LANES], e0[2][LANES], e1[2][LANES]; // [0] from LL | LH, [1] from HL | HH
+    for (int s = 0; s < 2; s++) {
+        const int l = off[s], h = off[2 + s];
+        load(h + i0 * bw, h0[s]);
+        evrow(l, h, i0, bw, bh, e0[s]);
+        if (LA == 2) {
+            load(h + min(i0 + 1, bh - 1) * bw, h1[s]);
+            evrow(l, h, i0 + 1, bw, bh, e1[s]);
+            evrow(l, h, i0 - 1, bw, bh, em1[s]);
+        } else { h1[s] = h0[s]; e1[s] = e0[s]; }
+    }
+    for (int i = i0; i < i1; i++) {
+        int ev[2][LANES], od[2][LANES];
+        for (int s = 0; s < 2; s++) {
+            const int l = off[s], h = off[2 + s], n = i + LA;
+            // the newest row: for LeGall h1 / e1 are the current row's (h0 / e0 are not used), for DD the next row's
+            int hn[LANES] = h1[s], en[LANES] = e1[s];
+            if (n < bh) {
+                int ln[LANES];
+                load(h + n * bw, hn); load(l + n * bw, ln);
+                for (int j = 0; j < LANES; j++) en[j] = upd(ln[j], h1[s][j], hn[j]);
+            }
+            if (LA == 1) {
+                ev[s] = e1[s];
+                for (int j = 0; j < LANES; j++) od[s][j] = pred(h1[s][j], 0, e1[s][j], en[j], 0);
+            } else {
+                ev[s] = e0[s];
+                for (int j = 0; j < LANES; j++) od[s][j] = pred(h0[s][j], em1[s][j], e0[s][j], e1[s][j], en[j]);
+                h0[s] = h1[s]; em1[s] = e0[s]; e0[s] = e1[s];
+            }
+            h1[s] = hn; e1[s] = en;
+        }
+        const int word = (pc.oofs[c] + 2 * i * pc.ostride[c]) / 2 + k0;
+        if (2 * i < pc.oh) hrow(ev[0], ev[1], edge, jl, jr, word);
+        if (2 * i + 1 < pc.oh) hrow(od[0], od[1], edge, jl, jr, word + pc.ostride[c] / 2);
+    }
+}

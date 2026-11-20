@@ -5,18 +5,34 @@
 # (--no-truncate), (c) our truncated streams against the same content written out in full: ffmpeg's decoder
 # parses one byte past a short slice component, so truncated streams are checked against ourselves.
 # Each stream is decoded three ways by us: one thread, three threads, and fed slice row by slice row.
+# GPU=cl (or vk): the same three ways again with vc2bench --gpu, which must give the same picture; the last
+# line says how many of these decodes ran on the GPU (wavelets it does not do stay on the CPU).
+# FFSYNC: ffmpeg's option against frame duplication ("-vsync passthrough" for ffmpeg 4).
 B=$1; CLIP=$2; W=$3; H=$4; WORK=${5:-$(mktemp -d)}
 RUN=${RUN:-}   # e.g. RUN="nice -n 19 taskset -c 10,11"
+GPU=${GPU:-}
+FFSYNC=${FFSYNC:--fps_mode passthrough}
+: > $WORK/gpu.count
 pass=0; fail=0
 # -cpuflags 0: ffmpeg's x86 SIMD dequantisation is wrong for slices whose subband width is not a multiple of 8
 # (e.g. 240-pixel slices); its C code, which is what arm64 runs, is right.
-ffdec() { $RUN ffmpeg -hide_banner -loglevel error -y -cpuflags 0 -i "$1" -fps_mode passthrough -f rawvideo -pix_fmt yuv422p10le "$2"; }
+ffdec() { $RUN ffmpeg -hide_banner -loglevel error -y -cpuflags 0 -i "$1" $FFSYNC -f rawvideo -pix_fmt yuv422p10le "$2"; }
 ours() { # stream -> prints the md5 if all three ways agree
     local a b c
     a=$($RUN $B/vc2bench --frames 4 --out $WORK/o1.yuv "$1" >/dev/null && md5sum < $WORK/o1.yuv)
     b=$($RUN $B/vc2bench --frames 4 --threads 3 --out $WORK/o2.yuv "$1" >/dev/null && md5sum < $WORK/o2.yuv)
     c=$($RUN $B/vc2bench --frames 4 --subframe 40 --out $WORK/o3.yuv "$1" >/dev/null && md5sum < $WORK/o3.yuv)
-    [ -n "$a" ] && [ "$a" = "$b" ] && [ "$a" = "$c" ] && echo "$a"
+    [ -n "$a" ] && [ "$a" = "$b" ] && [ "$a" = "$c" ] || return
+    if [ -n "$GPU" ]; then
+        local way g
+        for way in "" "--threads 3" "--subframe 40"; do
+            $RUN $B/vc2bench --frames 4 $way --gpu $GPU --out $WORK/o4.yuv "$1" > $WORK/o4.txt 2>/dev/null || return
+            g=$(md5sum < $WORK/o4.yuv)
+            [ "$g" = "$a" ] || return
+            grep -q " gpu " $WORK/o4.txt && echo >> $WORK/gpu.count
+        done
+    fi
+    echo "$a"
 }
 check() { # name stream reference.yuv
     local m r
@@ -48,4 +64,5 @@ for wl in 0 1; do for bpp in 1.5 2 3 5; do
     if [ -n "$(ours $WORK/rc.vc2)" ]; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL rate-controlled wavelet $wl bpp $bpp"; fi
 done; done
 echo "pass $pass fail $fail"
+[ -n "$GPU" ] && echo "decodes on the GPU ($GPU): $(wc -l < $WORK/gpu.count)"
 [ $fail = 0 ]
