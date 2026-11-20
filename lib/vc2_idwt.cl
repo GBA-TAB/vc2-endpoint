@@ -3,14 +3,17 @@
 // The Vulkan version of the same steps is lib/vc2_idwt.comp.
 //
 // One work-item = a tile of TW column pairs x RB row pairs of one component (of Cb and Cr for the CbCr plane
-// of NV20). It walks down its rows with a rolling window: per row pair it loads one more row of the four
+// of NV20); the tiles of all components lie side by side in the launch's x range, so that one launch does a
+// band of rows of the whole picture (a launch costs about 0.1 ms on the Mali-G610, whatever its size).
+// A work-item walks down its rows with a rolling window: per row pair it loads one more row of the four
 // bands, finishes the vertical lifting of that row pair and runs the horizontal lifting on the two rows.
 // A lane vector holds the band columns k0-2 .. k0+LANES-3 (k0 = the tile's first column pair), which is what
 // the horizontal lifting of the tile reaches; neighbouring tiles compute the overlap again. Nothing is
 // stored but the output. Loads may start two samples before a row and end past it (the caller pads).
 //
-// Build options: -DWL=0 (Deslauriers-Dubuc 9,7) or 1 (LeGall 5,3); -DLANES=8 or 16; -DRB=row pairs per item;
-// -DOUT=0 planar 16-bit, 1 NV20 Y plane, 2 NV20 CbCr plane; -DPIX_OFF, -DPIX_MAX.
+// Build options: -DWL=0 (Deslauriers-Dubuc 9,7) or 1 (LeGall 5,3); -DLANES=8 or 16 (16 is slower on the
+// G610: too many live registers); -DRB=row pairs per item; -DNV20=0 planar 16-bit output, 1 NV20 (Y plane and
+// CbCr plane); -DPIX_OFF, -DPIX_MAX.
 #if LANES == 8
 typedef short8 V;
 typedef ushort8 UV;
@@ -43,16 +46,7 @@ typedef ushort16 P;
 #define TO_P(v) as_ushort16(v)
 #endif
 #define ZIP4(a, b) ((ushort8)((a).s0, (b).s0, (a).s1, (b).s1, (a).s2, (b).s2, (a).s3, (b).s3))
-#if OUT == 2
-#define NC 2
-#else
-#define NC 1
-#endif
-#if OUT == 0
-typedef ushort OT;
-#else
-typedef uchar OT;
-#endif
+enum { PLANAR, NV20_Y, NV20_C };
 
 // the lifting steps, as in the 16-bit lanes of vc2_lift.h
 #define UPD(l, h0, h1) ((l) - (((h0) + (h1) + (short)2) >> (short)2)) // even -= (odd[i-1] + odd[i] + 2) >> 2
@@ -100,22 +94,21 @@ static inline void pack8(ushort8 s, __global uchar *p)
     ((__global ushort *)p)[4] = (ushort)(q.s1 >> 24);
 }
 
-__kernel void idwt(__global const short *cf, __global OT *out,
-                   int4 off0, int4 off1, // LL, HL, LH, HH: where each band starts in cf, per component
-                   int bw, int bh,       // band size; rows are bw apart
-                   int oofs, int ostride, int oh) // output: start and row distance in OT units, rows to write
+// one tile: nc components (2 = Cb and Cr together), band offsets bo[c][LL, HL, LH, HH], first column pair k0, first row i0
+static inline void tile(__global const short *cf, __global uchar *out, const int nc, const int mode, const int4 offa, const int4 offb,
+                        const int bw, const int bh, const int k0, const int i0, const int oofs, const int ostride, const int oh)
 {
-    const int k0 = (int)get_global_id(0) * TW, i0 = (int)get_global_id(1) * RB, i1 = min(i0 + RB, bh);
+    const int i1 = min(i0 + RB, bh);
     if (k0 >= bw || i0 >= bh) return;
     const int jl = k0 == 0 ? 2 : 0, jr = min(bw + 1 - k0, LANES - 1); // the lanes of columns 0 and bw - 1
     const int edge = k0 == 0 || bw + 1 - k0 < LANES - 1;
     const UV em = TO_UV(clamp(IOTA, (short)jl, (short)jr));
-    const int bo[2][4] = { { off0.s0, off0.s1, off0.s2, off0.s3 }, { off1.s0, off1.s1, off1.s2, off1.s3 } };
-    V h0[NC][2], e0[NC][2];
+    const int bo[2][4] = { { offa.s0, offa.s1, offa.s2, offa.s3 }, { offb.s0, offb.s1, offb.s2, offb.s3 } };
+    V h0[2][2], e0[2][2];
 #if LA == 2
-    V h1[NC][2], e1[NC][2], em1[NC][2];
+    V h1[2][2], e1[2][2], em1[2][2];
 #endif
-    for (int c = 0; c < NC; c++)
+    for (int c = 0; c < nc; c++)
         for (int s = 0; s < 2; s++) {
             __global const short *l = cf + bo[c][s] + k0 - 2, *h = cf + bo[c][2 + s] + k0 - 2;
             h0[c][s] = VLOAD(h + i0 * bw);
@@ -127,8 +120,8 @@ __kernel void idwt(__global const short *cf, __global OT *out,
 #endif
         }
     for (int i = i0; i < i1; i++) {
-        P r0[NC], r1[NC];
-        for (int c = 0; c < NC; c++) {
+        P r0[2], r1[2];
+        for (int c = 0; c < nc; c++) {
             V ev[2], od[2];
             for (int s = 0; s < 2; s++) {
                 __global const short *l = cf + bo[c][s] + k0 - 2, *h = cf + bo[c][2 + s] + k0 - 2;
@@ -155,30 +148,50 @@ __kernel void idwt(__global const short *cf, __global OT *out,
             const int y = 2 * i + t;
             if (y >= oh) break;
             const P a = t ? r1[0] : r0[0];
-#if OUT == 0
-            __global ushort *p = out + oofs + y * ostride + 2 * k0;
+            if (mode == PLANAR) {
+                __global ushort *p = (__global ushort *)out + oofs + y * ostride + 2 * k0;
 #if LANES == 8
-            vstore8(a, 0, p);
+                vstore8(a, 0, p);
 #else
-            vstore16(a, 0, p);
+                vstore16(a, 0, p);
 #endif
-#elif OUT == 1
-            __global uchar *p = out + oofs + y * ostride + k0 / 2 * 5;
+            } else if (mode == NV20_Y) {
+                __global uchar *p = out + oofs + y * ostride + k0 / 2 * 5;
 #if LANES == 8
-            pack8(a, p);
+                pack8(a, p);
 #else
-            pack8(a.lo, p); pack8(a.hi, p + 10);
+                pack8(a.lo, p); pack8(a.hi, p + 10);
 #endif
-#else
-            __global uchar *p = out + oofs + y * ostride + k0 * 5;
-            const P b = t ? r1[1] : r0[1];
+            } else {
+                __global uchar *p = out + oofs + y * ostride + k0 * 5;
+                const P b = t ? r1[1] : r0[1];
 #if LANES == 8
-            pack8(ZIP4(a.lo, b.lo), p); pack8(ZIP4(a.hi, b.hi), p + 10);
+                pack8(ZIP4(a.lo, b.lo), p); pack8(ZIP4(a.hi, b.hi), p + 10);
 #else
-            pack8(ZIP4(a.s0123, b.s0123), p); pack8(ZIP4(a.s4567, b.s4567), p + 10);
-            pack8(ZIP4(a.s89ab, b.s89ab), p + 20); pack8(ZIP4(a.scdef, b.scdef), p + 30);
+                pack8(ZIP4(a.s0123, b.s0123), p); pack8(ZIP4(a.s4567, b.s4567), p + 10);
+                pack8(ZIP4(a.s89ab, b.s89ab), p + 20); pack8(ZIP4(a.scdef, b.scdef), p + 30);
 #endif
-#endif
+            }
         }
     }
+}
+
+// x = tiles of Y, then of Cb, then of Cr (planar), or of Y, then of Cb and Cr together (NV20); y = blocks of RB band rows
+__kernel void idwt(__global const short *cf, __global uchar *out,
+                   int4 off0, int4 off1, int4 off2, // where LL, HL, LH, HH start in cf (in shorts), for Y, Cb, Cr
+                   int4 bw, int bh,                 // band widths of Y, Cb, Cr (rows are that far apart); band height
+                   int4 oofs, int4 ostride, int oh) // output per plane: start and row distance (planar: in samples,
+                                                    // NV20: in bytes), rows to write
+{
+    const int gx = (int)get_global_id(0), i0 = (int)get_global_id(1) * RB;
+    const int n0 = (bw.s0 + TW - 1) / TW, n1 = (bw.s1 + TW - 1) / TW;
+#if NV20
+    if (gx < n0) tile(cf, out, 1, NV20_Y, off0, off0, bw.s0, bh, gx * TW, i0, oofs.s0, ostride.s0, oh);
+    else tile(cf, out, 2, NV20_C, off1, off2, bw.s1, bh, (gx - n0) * TW, i0, oofs.s1, ostride.s1, oh);
+#else
+    const int c = gx < n0 ? 0 : gx < n0 + n1 ? 1 : 2;
+    const int4 o = c == 0 ? off0 : c == 1 ? off1 : off2;
+    tile(cf, out, 1, PLANAR, o, o, c == 0 ? bw.s0 : c == 1 ? bw.s1 : bw.s2, bh, (gx - (c == 0 ? 0 : c == 1 ? n0 : n0 + n1)) * TW, i0,
+         c == 0 ? oofs.s0 : c == 1 ? oofs.s1 : oofs.s2, c == 0 ? ostride.s0 : c == 1 ? ostride.s1 : ostride.s2, oh);
+#endif
 }

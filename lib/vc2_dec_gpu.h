@@ -18,8 +18,8 @@ struct dec_gpu {
     vc2_gpu_bufs b;
     int batch;                   // blocks per launch
     int depth;                   // of the configured stream
-    int nunits, nblk[3];
-    uint8_t *launched[3];        // per unit and block
+    int nblk;
+    uint8_t *launched;           // per block
     int nv20;                    // this frame's output
     int frame_open;
     int fd;                      // NV20 target as a dma-buf (-1 = none)
@@ -48,7 +48,7 @@ static void gpu_unconfigure(vc2_dec *d)
         }
     G->api->destroy(G->g);
     G->g = 0;
-    for (int u = 0; u < 3; u++) { free(G->launched[u]); G->launched[u] = 0; }
+    free(G->launched); G->launched = 0;
     d->gpu_on = 0;
 }
 
@@ -61,12 +61,10 @@ static void gpu_configure(vc2_dec *d)
     const char *why = 0;
     if (!d->fin16) why = "needs the 16-bit last level (10-bit video, wavelets 0-4)";
     else if (d->pic.wavelet != VC2_WL_LEGALL5_3 && d->pic.wavelet != VC2_WL_DD9_7) why = "only LeGall 5,3 and Deslauriers-Dubuc 9,7";
+    else if (d->seq.chroma == 2) why = "not for 4:2:0";
     if (!why) {
-        vc2_gpu_cfg cfg = { d->pic.wavelet, d->seq.bit_depth, 3, { 0 }, { 0 }, { 0 }, { 0 }, d->threads, G->cpus, G->ncpus };
-        for (int c = 0; c < 3; c++) {
-            cfg.bw[c] = d->pl[c].g.bw[depth]; cfg.bh[c] = d->pl[c].g.bh[depth];
-            cfg.w[c] = d->pl[c].g.w; cfg.h[c] = d->pl[c].g.h;
-        }
+        vc2_gpu_cfg cfg = { d->pic.wavelet, d->seq.bit_depth, 3, { 0 }, d->pl[0].g.bh[depth], { 0 }, d->pl[0].g.h, d->threads, G->cpus, G->ncpus };
+        for (int c = 0; c < 3; c++) { cfg.bw[c] = d->pl[c].g.bw[depth]; cfg.w[c] = d->pl[c].g.w; }
         G->g = G->api->create(&cfg, &G->b);
         if (!G->g) why = "the backend could not start";
     }
@@ -84,9 +82,9 @@ static void gpu_configure(vc2_dec *d)
             for (int o = 1; o < 4; o++) { free(k->band[c][depth][o]); k->band[c][depth][o] = G->b.band[c][o]; }
         }
         *gpu_ll_rows(d, c) = p->brows[depth] = gpu_pow2ceil(p->g.bh[depth]); // whole planes: the ring never wraps
-        G->nblk[c] = (p->g.bh[depth] + G->b.rb - 1) / G->b.rb;
-        G->launched[c] = calloc(G->nblk[c], 1);
     }
+    G->nblk = (d->pl[0].g.bh[depth] + G->b.rb - 1) / G->b.rb;
+    G->launched = calloc(G->nblk, 1);
     G->batch = getenv("VC2_GPU_BATCH") ? atoi(getenv("VC2_GPU_BATCH")) : 4;
     if (G->batch < 1) G->batch = 1;
     G->depth = depth;
@@ -108,8 +106,7 @@ static int gpu_begin(vc2_dec *d, vc2_frame *out)
     if (G->nv20 && !gpu_nv20_ok(d)) return -1;
     vc2_gpu_target t = { G->nv20, G->fd, G->y_off, G->c_off, d->nv20_y, d->nv20_c, G->fd >= 0 ? G->pitch : d->nv20_pitch };
     if (G->api->begin(G->g, &t)) return -1;
-    G->nunits = G->nv20 ? 2 : 3;
-    for (int u = 0; u < G->nunits; u++) memset(G->launched[u], 0, G->nblk[u]);
+    memset(G->launched, 0, G->nblk);
     G->frame_open = 1;
     gpu_casc_start(d, &d->cs[0], 0, d->pic.slices_y);
     for (int c = 0; out && c < 3; c++) { out->plane[c] = G->b.pix[c]; out->stride[c] = G->b.pstride[c]; }
@@ -128,45 +125,40 @@ static void gpu_wrote_rows(vc2_dec *d, int c, int r0, int r1)
 static void gpu_casc_start(vc2_dec *d, casc_t *k, int r0, int r1)
 {
     struct dec_gpu *G = d->gpu;
-    const int depth = d->pic.depth, rb = G->b.rb;
-    for (int c = 0; c < 3; c++) {
-        const comp_t *p = &d->pl[c];
-        k->ll0[c] = p->ys[depth][r0];
-        k->ll1[c] = r1 >= d->pic.slices_y ? INT_MAX : p->ys[depth][r1];
-        int first = k->ll0[c] ? (k->ll0[c] + d->up + rb - 1) / rb : 0;
-        k->gblk[c] = first;
-        int row = first * rb - d->up, end = k->ll1[c] < p->g.bh[depth] ? k->ll1[c] : p->g.bh[depth];
-        row = row < k->ll0[c] ? k->ll0[c] : row > end ? end : row;
-        k->gcl0[c] = k->gcl1[c] = row;
+    const int depth = d->pic.depth, rb = G->b.rb, bh = d->pl[0].g.bh[depth];
+    for (int c = 0; c < 3; c++) { // the same rows for every component: the band heights are equal
+        k->ll0[c] = d->pl[c].ys[depth][r0];
+        k->ll1[c] = r1 >= d->pic.slices_y ? INT_MAX : d->pl[c].ys[depth][r1];
     }
+    const int end = k->ll1[0] < bh ? k->ll1[0] : bh;
+    k->gblk = k->ll0[0] ? (k->ll0[0] + d->up + rb - 1) / rb : 0;
+    int row = k->gblk * rb - d->up;
+    k->gcl0 = k->gcl1 = row < k->ll0[0] ? k->ll0[0] : row > end ? end : row;
 }
 
 // after the cascade has advanced: launch the blocks whose inputs it has written (final: all it will ever have)
 static void gpu_progress(vc2_dec *d, casc_t *k, int final)
 {
     struct dec_gpu *G = d->gpu;
-    const int depth = d->pic.depth, rb = G->b.rb, thread = (int)(k - d->cs);
+    const int depth = d->pic.depth, rb = G->b.rb, thread = (int)(k - d->cs), bh = d->pl[0].g.bh[depth];
     if (!G->frame_open) return;
-    for (int u = 0; u < G->nunits; u++) {
-        const int c0 = G->nv20 && u ? 1 : u, c1 = G->nv20 && u ? 2 : u, bh = d->pl[c0].g.bh[depth];
-        int rows = k->syn_done[c0][depth] < k->syn_done[c1][depth] ? k->syn_done[c0][depth] : k->syn_done[c1][depth];
-        if (k->ll1[c0] != INT_MAX && rows > k->ll1[c0] - d->down) rows = k->ll1[c0] - d->down; // below: the next thread's rows
-        int g1 = rows >= bh ? G->nblk[u] : rows / rb, g0 = k->gblk[u];
-        if (g1 - g0 < (final ? 1 : G->batch)) continue;
-        int need = g1 * rb + d->down < bh ? g1 * rb + d->down : bh;
-        for (int c = c0; c <= c1; c++)
-            if (need > k->gcl1[c]) { gpu_wrote_rows(d, c, k->gcl1[c], need); k->gcl1[c] = need; }
-        if (G->api->launch(G->g, thread, u, g0, g1)) continue; // left for gpu_finish, which reports the error
-        memset(G->launched[u] + g0, 1, g1 - g0);
-        k->gblk[u] = g1;
+    int rows = k->syn_done[0][depth];
+    for (int c = 1; c < 3; c++) if (k->syn_done[c][depth] < rows) rows = k->syn_done[c][depth];
+    if (k->ll1[0] != INT_MAX && rows > k->ll1[0] - d->down) rows = k->ll1[0] - d->down; // below: the next thread's rows
+    const int g1 = rows >= bh ? G->nblk : rows / rb, g0 = k->gblk;
+    if (g1 - g0 >= (final ? 1 : G->batch)) {
+        const int need = g1 * rb + d->down < bh ? g1 * rb + d->down : bh;
+        if (need > k->gcl1) { for (int c = 0; c < 3; c++) gpu_wrote_rows(d, c, k->gcl1, need); k->gcl1 = need; }
+        if (!G->api->launch(G->g, thread, g0, g1)) { // on an error the blocks are left for gpu_finish, which reports it
+            memset(G->launched + g0, 1, g1 - g0);
+            k->gblk = g1;
+        }
     }
     if (!final) return;
-    for (int c = 0; c < 3; c++) { // the rest of the rows this cascade owns
-        int end = k->ll1[c] < d->pl[c].g.bh[depth] ? k->ll1[c] : d->pl[c].g.bh[depth];
-        gpu_wrote_rows(d, c, k->ll0[c], k->gcl0[c]);
-        gpu_wrote_rows(d, c, k->gcl1[c], end);
-        k->gcl0[c] = k->ll0[c]; k->gcl1[c] = end > k->gcl1[c] ? end : k->gcl1[c];
-    }
+    const int end = k->ll1[0] < bh ? k->ll1[0] : bh; // the rest of the rows this cascade owns
+    for (int c = 0; c < 3; c++) { gpu_wrote_rows(d, c, k->ll0[0], k->gcl0); gpu_wrote_rows(d, c, k->gcl1, end); }
+    k->gcl0 = k->ll0[0];
+    if (end > k->gcl1) k->gcl1 = end;
 }
 
 // all cascades are done: launch what is left (the blocks across the threads' borders) and wait
@@ -176,14 +168,13 @@ static int gpu_finish(vc2_dec *d)
     int rc = 0;
     if (!G->frame_open) return 0;
     G->frame_open = 0;
-    for (int u = 0; u < G->nunits; u++)
-        for (int g = 0; g < G->nblk[u];) {
-            if (G->launched[u][g]) { g++; continue; }
-            int e = g;
-            while (e < G->nblk[u] && !G->launched[u][e]) e++;
-            rc |= G->api->launch(G->g, 0, u, g, e);
-            g = e;
-        }
+    for (int g = 0; g < G->nblk;) {
+        if (G->launched[g]) { g++; continue; }
+        int e = g;
+        while (e < G->nblk && !G->launched[e]) e++;
+        rc |= G->api->launch(G->g, 0, g, e);
+        g = e;
+    }
     rc |= G->api->finish(G->g, &G->t_gpu);
     return rc ? -1 : 0;
 }

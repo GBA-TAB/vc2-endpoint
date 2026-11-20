@@ -55,7 +55,7 @@ typedef struct {          // one cascade
     uint8_t *qi;
     uint16_t *line[3];    // NV20 staging rings
     int ll0[3], ll1[3];   // rows of the last level's LL this cascade writes (all of them, except on the GPU path)
-    int gblk[3], gcl0[3], gcl1[3]; // GPU path: next block to launch per unit, rows handed over per component
+    int gblk, gcl0, gcl1; // GPU path: the next block to launch, the rows handed over so far
     double t[3];
 } casc_t;
 

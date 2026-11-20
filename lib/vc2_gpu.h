@@ -11,8 +11,8 @@
 
 typedef struct {
     int wavelet, bit_depth, ncomp;
-    int bw[3], bh[3];            // band size of the last level
-    int w[3], h[3];              // picture size of each component
+    int bw[3], bh;               // band size of the last level (the same height for all components)
+    int w[3], h;                 // picture size of each component
     int threads;                 // threads that launch (indices 0 .. threads-1)
     const int *cpus; int ncpus;  // cores for the driver's own threads (0 = wherever the caller runs)
 } vc2_gpu_cfg;
@@ -39,8 +39,7 @@ typedef struct {
     void (*destroy)(vc2_gpu *g);
     int (*begin)(vc2_gpu *g, const vc2_gpu_target *t);                  // a new frame
     void (*wrote)(vc2_gpu *g, const void *p, size_t bytes);             // the CPU has written this part of the coefficients (any thread)
-    int (*launch)(vc2_gpu *g, int thread, int unit, int blk0, int blk1); // transform blocks [blk0, blk1) of a unit:
-                                                                        // planar: unit = component; NV20: 0 = Y, 1 = Cb and Cr
+    int (*launch)(vc2_gpu *g, int thread, int blk0, int blk1);          // transform blocks [blk0, blk1), all components
     int (*finish)(vc2_gpu *g, double *gpu_seconds);                     // wait for all launches; the output is complete
 } vc2_gpu_api;
 
