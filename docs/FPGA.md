@@ -220,6 +220,8 @@ The per-picture values travel with the picture, so no register write has to be t
   slices_y, prefix_bytes. A repeated identical sequence header is no change (ffmpeg repeats it before every
   picture). **Per picture:** size_scaler and the matrix.
 - **The host only sends what the subset covers** (`vc2_fpga_subset`); anything else stays on the CPU decoder.
+- **The host also walks the slice headers:** a picture whose slice lengths run past its end (damaged in transit)
+  stays on the CPU decoder. On the card it would read into the next descriptor (ERR_OVERRUN, then a reset).
 
 **`tools/vc2fpga in.vc2 [out.h2c [pictures]]`** packs a stream, writes the H2C bytes, and checks them with a card
 model: it rebuilds a VC-2 stream from each descriptor and its slice bytes alone, and decodes it against the
@@ -242,8 +244,12 @@ bytes of the dumped frames in each stream's folder as `stream.h2c`.
   `vc2x_send` / `vc2x_recv` (one thread each; the receiver best on an A76), `vc2x_status`, `vc2x_reset`.
 - **`lib/vc2_xdma_model.c`** is `vc2x_open("model:[threads=N,cpus=a/b,queue=N]")`. It passes the H2C stream
   through the card model and the CPU decoder into interleaved NV20, with back-pressure, the status block, and the
-  card's error flags: ERR_MAGIC (stream lost until reset), ERR_FORMAT (outside the subset, dropped), ERR_GEOM
-  (more than 8 level-4 rows per slice row, e.g. 64x32 slices), ERR_OVERRUN.
+  card's error flags, behaving as the RTL does (pmod-b3, 2026-11-21):
+  - ERR_MAGIC, ERR_FORMAT, ERR_OVERRUN: the card stops at that descriptor and puts nothing out for it. The
+    pictures before it come out complete, and it takes no data until `vc2x_reset`. On the card a send blocks
+    until the xdma driver's 10 s timeout; the model fails it at once with EIO.
+  - ERR_GEOM (more than 8 level-4 rows per slice row, e.g. 64x32 slices): a full-length picture with undefined
+    content (the model's is correct), and the flag stays until reset.
 - **`tools/vc2xbench [--dev D] [--frames N] [--fps F] [--piece N] [--send-cpu C] [--recv-cpu C] in.vc2`** sends a
   stream through either backend. It compares every picture with the CPU decoder and reports MB/s, pictures/s,
   latency to the first and the last lines, CPU per picture, and the status flags.

@@ -7,10 +7,12 @@
 // visible to the host:
 //   - back-pressure: vc2x_send blocks while QUEUE pictures wait to be read, vc2x_recv blocks until bytes exist;
 //   - the status block: picture count and luma lines of the picture being output, pictures completed, the flags;
-//   - VC2X_ERR_MAGIC: the stream is lost (no descriptor where one must start), everything sent is ignored until
-//     vc2x_reset; VC2X_ERR_FORMAT: a picture outside the subset, dropped (no output); VC2X_ERR_GEOM: more than 8
-//     level-4 rows per slice row (the card's band buffers; the card puts out a wrong picture, the model a right
-//     one, so the output stays in step); VC2X_ERR_OVERRUN: the decoder failed on the slices, picture dropped.
+//   - VC2X_ERR_MAGIC (no descriptor where one must start), VC2X_ERR_FORMAT (a picture outside the subset) and
+//     VC2X_ERR_OVERRUN (the slices run past the descriptor's slice bytes): the card stops at that descriptor and
+//     puts nothing out for it; the pictures before it come out complete; it takes no H2C data until vc2x_reset
+//     (a send blocks until the xdma driver's 10 s timeout). The model fails such sends at once with EIO.
+//   - VC2X_ERR_GEOM: more than 8 level-4 rows per slice row (the card's band buffers). The card puts out a
+//     full-length picture with undefined content, the model a correct one; the flag stays until reset.
 //   VC2X_SATURATED is never set: the CPU decoder computes at full width.
 // Arguments after "model:", comma separated: threads=N (decoder threads, default 2), cpus=a/b/c (pin them),
 // queue=N (pictures held before vc2x_send blocks, default 2).
@@ -61,7 +63,7 @@ static size_t one(model *m, uint32_t gen)
     if (vc2_fpga_desc_read(m->in, m->in_len, &d)) { m->lost = 1; m->flags |= VC2X_ERR_MAGIC; return m->in_len; }
     size_t total = (VC2_FPGA_DESC_LEN + (size_t)d.slice_bytes + VC2_FPGA_ALIGN - 1) & ~(size_t)(VC2_FPGA_ALIGN - 1);
     if (m->in_len < total) return 0;
-    if (subset(&d)) { m->flags |= VC2X_ERR_FORMAT; return total; }
+    if (subset(&d)) { m->lost = 1; m->flags |= VC2X_ERR_FORMAT; return m->in_len; }
     if (!geom_ok(&d)) m->flags |= VC2X_ERR_GEOM;
     if (m->au_cap < d.slice_bytes + 256) {
         free(m->au);
@@ -72,7 +74,7 @@ static size_t one(model *m, uint32_t gen)
     size_t line = vc2x_line_bytes(d.width), size = vc2x_picture_bytes(d.width, d.height);
     pic *p = calloc(1, sizeof *p);
     if (p) p->data = malloc(size);
-    if (!n || !p || !p->data) { if (p) free(p->data); free(p); m->flags |= VC2X_ERR_OVERRUN; return total; }
+    if (!n || !p || !p->data) { if (p) free(p->data); free(p); m->lost = 1; m->flags |= VC2X_ERR_OVERRUN; return m->in_len; }
     // decode without the lock, so that vc2x_recv and vc2x_status go on meanwhile
     pthread_mutex_unlock(&m->mu);
     vc2_dec_set_nv20(m->dec, p->data, p->data + line, 2 * line);
@@ -81,8 +83,9 @@ static size_t one(model *m, uint32_t gen)
     pthread_mutex_lock(&m->mu);
     if (bad || gen != m->gen) { // decoder error, or a reset meanwhile
         free(p->data); free(p);
-        if (bad && gen == m->gen) m->flags |= VC2X_ERR_OVERRUN;
-        return gen == m->gen ? total : 0;
+        if (gen != m->gen) return 0;
+        m->lost = 1; m->flags |= VC2X_ERR_OVERRUN;
+        return m->in_len;
     }
     p->len = size; p->pair = 2 * line; p->count = d.au_index;
     if (m->tail) m->tail->next = p; else m->head = p;
@@ -98,7 +101,7 @@ static int m_send(vc2x *x, const void *buf, size_t len)
     if (len % 16) { errno = EINVAL; return -1; }
     pthread_mutex_lock(&m->mu);
     uint32_t gen = m->gen;
-    if (m->lost) { pthread_mutex_unlock(&m->mu); return 0; } // the card drops everything until a reset
+    if (m->lost) { pthread_mutex_unlock(&m->mu); errno = EIO; return -1; } // the card takes nothing until a reset
     if (m->in_len + len > m->in_cap) {
         size_t cap = (m->in_len + len) * 2;
         uint8_t *n = realloc(m->in, cap);

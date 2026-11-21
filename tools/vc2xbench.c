@@ -8,6 +8,7 @@
 //   --send-cpu C, --recv-cpu C   pin the two threads (the receiver best on an A76, CPUs 4-7 on the RK3588)
 //   --no-check      don't compare with the CPU decoder (else every distinct picture of the first pass is compared)
 //   --out f.nv20    write the received pictures of the first pass (interleaved NV20, as received)
+// With ERR_GEOM set the card's pictures have undefined content, so mismatches are expected there.
 // Prints per picture only on a mismatch; at the end: pictures, mismatches, MB/s, pictures/s, latency from the start
 // of the send to the first and to the last line, CPU per picture, and the card's status flags.
 #define _GNU_SOURCE

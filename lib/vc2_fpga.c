@@ -87,6 +87,20 @@ size_t vc2_fpga_pack(vc2_fpga_tx *t, const uint8_t *au, size_t len, uint8_t *out
             vc2_pic p;
             if (!t->have_seq || vc2_parse_pic(pl, plen, &t->seq, &p)) return 0;
             if ((*why = vc2_fpga_subset(&t->seq, &p))) return 0;
+            // the slice lengths must stay inside the picture: the card would read past it into the next descriptor
+            // (ERR_OVERRUN, then a reset). A picture damaged in transit is kept on the CPU decoder instead.
+            {
+                const uint8_t *sp = pl + p.slices_offset, *end = pl + plen;
+                for (long k = (long)p.slices_x * p.slices_y; k > 0; k--) {
+                    if ((size_t)(end - sp) < (size_t)p.prefix_bytes + 4) { *why = "slices run past the picture"; return 0; }
+                    sp += p.prefix_bytes + 1;
+                    for (int c = 0; c < 3; c++) {
+                        size_t l = (size_t)*sp++ * p.size_scaler;
+                        if ((size_t)(end - sp) < l + (c < 2)) { *why = "slices run past the picture"; return 0; }
+                        sp += l;
+                    }
+                }
+            }
             size_t sb = plen - p.slices_offset, total = (VC2_FPGA_DESC_LEN + sb + VC2_FPGA_ALIGN - 1) & ~(size_t)(VC2_FPGA_ALIGN - 1);
             if (total > cap || sb > 0xffffffffu) { *why = "output buffer too small"; return 0; }
             if (t->have_pic && fixed_changed(&p, &t->last)) t->new_seq = 1;
