@@ -336,6 +336,25 @@ Paced 1080p50, 1500 frames, latency from the last byte to the last line:
 So the Pi 5 decodes 1080p50 on the CPU with two cores to spare; UHD 50p is out of reach there (about 20 fps).
 On v3dv the output matches the CPU path in every mode tried (1080p and UHD; 1 and 3 threads, sub-frame).
 
+Orange Pi 5 Plus (RK3588, A76 at 2.26 / 2.30 GHz, fan at full, Armbian vendor 6.1 with Mali kbase g25p0;
+the OpenCL library was the board's libmali g13p0 loaded from a user directory, which the newer kernel
+driver accepts; run as root because `/dev/dma_heap` is root-only on that image), same streams:
+
+| UHD, 3000 frames paced at 50 fps | latency avg | max | late | CPU per frame |
+|---|---:|---:|---:|---:|
+| CPU only, 4 x A76, 2 bpp | 18.2 ms | 18.5 ms | 0 | 67.8 ms |
+| CPU only, 4 x A76, 3 bpp | (49.2 fps, falls behind) | | 3000 | 75.4 ms |
+| 3 x A76 + GPU, 3 bpp, NV20 | 18.6 ms | 19.5 ms | 0 | 51.9 ms |
+| 4 x A76 + GPU, 3 bpp, NV20 | 16.4 ms | 17.0 ms | 0 | 59.4 ms |
+| 3 x A76 + GPU, 2 bpp, NV20 | 16.8 ms | 19.9 ms | 0 | 46.0 ms |
+| 4 x A76 + GPU, 2 bpp, NV20 | 15.1 ms | 20.4 ms | 1 | 54.9 ms |
+
+Flat out with the GPU: 53.9 fps (3 x A76) and 61.3 fps (4 x A76) at 3 bpp; GPU time 6.3-6.6 ms per frame.
+1080p 3 bpp on the CPU: 191 fps on 3 x A76 (5.2 ms), and paced 1080p50 on two cores at 8.4 ms (max 8.6),
+0 late in 1500. The GPU output was identical to the CPU path (UHD, 2 and 3 bpp). With the faster clock and
+the fan this board reaches UHD 50p at 3 bpp with three A76 cores and the GPU, and at 2 bpp on the CPU alone;
+the SoC stayed at 51-56 C. Not tried on screen (no display was connected).
+
 ## 7. RTP (RFC 8450)
 
 `lib/vc2_rtp.c` packetises an encoded frame (sequence header, transform parameters, fragments of whole
