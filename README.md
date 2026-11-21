@@ -255,8 +255,8 @@ the CPU.
   copies, no cache cleaning by the driver); the NV20 output can be a scanout dma-buf, which the player uses.
 - **Vulkan compute**: the same blocks and steps as a GLSL shader without 16-bit types; host-visible buffers,
   planar output (NV20 is then packed on the CPU). Checked on lavapipe (Mesa's software Vulkan) on the x86
-  host; it has not run on a hardware Vulkan driver yet (the board's libmali has none, and the Pi 5 was
-  offline).
+  host and on a hardware driver, the Raspberry Pi 5's V3D 7.1 (Mesa v3dv 26.2): bit-identical there, but
+  about 40 times slower than the CPU (below), so it is not a speed-up on that GPU.
 
 Bit-exactness: on the board, 64 of 64 comparisons of the OpenCL path with the CPU path are identical (8
 clips: 1080p and UHD, both wavelets, 2 and 3 bpp; 1, 3, 4, 7 threads, sub-frame, cached heap, NV20 into a
@@ -313,6 +313,28 @@ at UHD the GPU path gives 40 fps on three A76 (CPU: 32): 50p is not reached with
     GPU=cl scripts/verify.sh build in.yuv 1920 1080
     # any host with Mesa: Vulkan on lavapipe
     make BUILD=build GPU=vk && GPU=vk scripts/verify.sh build in.yuv 1920 1080
+
+Raspberry Pi 5 (4 x A76 at 2.4 GHz, active cooler, V3D 7.1 with Mesa v3dv 26.2), same content, 4:2:2 10-bit,
+LeGall 5,3:
+
+| | fps | decode | CPU per frame |
+|---|---:|---:|---:|
+| 1080p 3 bpp, CPU, 4 threads, flat out | 84.5 | 11.8 ms | 39.4 ms |
+| 1080p 3 bpp, Vulkan (v3dv), 4 threads | 2.2 | 459 ms | 27.5 ms |
+| UHD 3 bpp, CPU, 4 threads | 19.6 | 51.1 ms | 172 ms |
+| UHD 2 bpp, CPU, 4 threads | 19.8 | 50.6 ms | 170 ms |
+| UHD 3 bpp, Vulkan (v3dv), 4 threads | 0.6 | 1768 ms | 121 ms |
+
+Paced 1080p50, 1500 frames, latency from the last byte to the last line:
+
+| | avg | max | late | CPU cores at 50 fps |
+|---|---:|---:|---:|---:|
+| 3 bpp, 2 threads | 8.1 ms | 18.6 ms | 0 | 0.77 |
+| 3 bpp, 3 threads | 8.9 ms | 15.7 ms | 0 | 1.26 |
+| 2 bpp, 2 threads | 7.3 ms | 14.2 ms | 0 | 0.69 |
+
+So the Pi 5 decodes 1080p50 on the CPU with two cores to spare; UHD 50p is out of reach there (about 20 fps).
+On v3dv the output matches the CPU path in every mode tried (1080p and UHD; 1 and 3 threads, sub-frame).
 
 ## 7. RTP (RFC 8450)
 
