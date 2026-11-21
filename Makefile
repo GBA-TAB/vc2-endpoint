@@ -9,7 +9,7 @@ endif
 ifeq ($(ARCH),aarch64)
 CFLAGS += -mcpu=native
 endif
-LIB := $(BUILD)/vc2_common.o $(BUILD)/vc2_dec.o $(BUILD)/vc2_enc.o $(BUILD)/vc2_rtp.o $(BUILD)/vc2_fpga.o
+LIB := $(BUILD)/vc2_common.o $(BUILD)/vc2_dec.o $(BUILD)/vc2_enc.o $(BUILD)/vc2_rtp.o $(BUILD)/vc2_fpga.o $(BUILD)/vc2_xdma.o $(BUILD)/vc2_xdma_model.o
 # GPU path for the decoder's last wavelet level, optional: make GPU=cl (OpenCL on Mali / libmali),
 # GPU=vk (Vulkan compute), GPU="cl vk". Without it nothing here needs OpenCL or Vulkan.
 GPU ?=
@@ -26,12 +26,14 @@ GPULIBS += -lvulkan
 GLSLC ?= glslc   # or GLSLC="glslangValidator -V"
 GLSLC_FLAGS ?= $(if $(findstring glslangValidator,$(GLSLC)),-S comp,-fshader-stage=compute -O)
 endif
-TOOLS := $(BUILD)/vc2enc $(BUILD)/vc2dec $(BUILD)/psnr $(BUILD)/vc2bench $(BUILD)/vc2send $(BUILD)/vc2recv $(BUILD)/vc2dump $(BUILD)/vc2fpga
+TOOLS := $(BUILD)/vc2enc $(BUILD)/vc2dec $(BUILD)/psnr $(BUILD)/vc2bench $(BUILD)/vc2send $(BUILD)/vc2recv $(BUILD)/vc2dump $(BUILD)/vc2fpga $(BUILD)/vc2xbench
 
 all: $(TOOLS)
 $(BUILD):
 	mkdir -p $(BUILD)
-$(BUILD)/%.o: lib/%.c lib/vc2.h lib/vc2_priv.h lib/vc2_lift.h lib/vc2_gpu.h lib/vc2_dec_gpu.h lib/vc2_fpga.h | $(BUILD)
+# lib/vc2_xdma.c (pmod-b3's) with the model backend linked in: its weak default stays out
+$(BUILD)/vc2_xdma.o: CFLAGS += -DVC2X_HAVE_MODEL
+$(BUILD)/%.o: lib/%.c lib/vc2.h lib/vc2_priv.h lib/vc2_lift.h lib/vc2_gpu.h lib/vc2_dec_gpu.h lib/vc2_fpga.h lib/vc2_xdma.h | $(BUILD)
 	$(CC) $(CFLAGS) -c $< -o $@
 $(BUILD)/vc2_idwt.spv: lib/vc2_idwt.comp | $(BUILD)
 	$(GLSLC) $(GLSLC_FLAGS) -o $@ $<

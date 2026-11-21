@@ -226,3 +226,28 @@ model: it rebuilds a VC-2 stream from each descriptor and its slice bytes alone,
 original. Over both vector sets (1080p, 2160p): every picture identical, and exactly the streams outside the
 subset refused (DD 9,7, depth 3, the non-uniform 60x67 slices at 2160p). `fpga-vectors.sh make` puts the H2C
 bytes of the dumped frames in each stream's folder as `stream.h2c`.
+
+## 10. The card's host library: `lib/vc2_xdma` (by pmod-b3) and its model
+
+- **The card side** (pmod-b3's interface note 2026-11-21T2116Z):
+  - H2C window 0x9000_0000 and C2H window 0xA000_0000, both byte streams (every transfer starts at the base);
+  - the status block at user BAR 0x60000: ID "VC2D", version, flags, the picture count and luma lines of the
+    picture being output, pictures done, reset;
+  - the output is NV20 with the lines interleaved (Y line, CbCr line, ...), so in memory NV20 with both planes at
+    pitch 2 x line and CbCr at offset 1 line. One C2H transfer per picture, no frame buffer on the card.
+  - Checked on the RK3588 (rockchip-drm, user space): the driver accepts this layout as an NV20 framebuffer at
+    1080p and 2160p, and its dumb buffers can be pinned by get_user_pages, so `vc2x_recv` can read straight into
+    the scanout buffer.
+- **`lib/vc2_xdma.c`** (pmod-b3) is the hardware backend over the xdma character devices: `vc2x_open("/dev/xdma0")`,
+  `vc2x_send` / `vc2x_recv` (one thread each; the receiver best on an A76), `vc2x_status`, `vc2x_reset`.
+- **`lib/vc2_xdma_model.c`** is `vc2x_open("model:[threads=N,cpus=a/b,queue=N]")`. It passes the H2C stream
+  through the card model and the CPU decoder into interleaved NV20, with back-pressure, the status block, and the
+  card's error flags: ERR_MAGIC (stream lost until reset), ERR_FORMAT (outside the subset, dropped), ERR_GEOM
+  (more than 8 level-4 rows per slice row, e.g. 64x32 slices), ERR_OVERRUN.
+- **`tools/vc2xbench [--dev D] [--frames N] [--fps F] [--piece N] [--send-cpu C] [--recv-cpu C] in.vc2`** sends a
+  stream through either backend. It compares every picture with the CPU decoder and reports MB/s, pictures/s,
+  latency to the first and the last lines, CPU per picture, and the status flags.
+  - Through the model: all subset streams of both vector sets identical, and ERR_GEOM on 64x32 at 1080p.
+  - 1080p50 paced: 200 of 200 pictures on caspar; 100 of 100 on the Orange Pi (model on A76 cores 5-6,
+    receiver on 4).
+  - The same command with `--dev /dev/xdma0` is the first test on the card.
