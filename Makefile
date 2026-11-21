@@ -1,4 +1,4 @@
-# Out-of-tree build: make BUILD=~/build/vc2-endpoint  (caspar: nice -n 19 taskset -c 10,11 make ...)
+# Out-of-tree build: make BUILD=/some/dir
 BUILD ?= build
 CC ?= gcc
 ARCH := $(shell uname -m)

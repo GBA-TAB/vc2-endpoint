@@ -1,80 +1,81 @@
-# VC-2 HQ over RTP (RFC 8450): design note
+# VC-2 HQ over RTP (RFC 8450)
 
-Status: design only. Nothing here has been run on a network; the repo's tools are file-based. The packet
-layout below is written from memory of RFC 8450: check it against the RFC before building on it.
+Implemented in `lib/vc2_rtp.c`, with the tools `vc2send` and `vc2recv`. Tested on a loopback interface only
+(see the README for the figures); it has not been run on a real network. Section numbers below refer to
+RFC 8450.
 
-## What RFC 8450 carries
+## Packets (section 4)
 
-RFC 8450 defines an RTP payload for VC-2 HQ profile streams. Every RTP packet carries one of:
+Every packet carries one data unit, after the RTP header and a 4-byte payload header (extended sequence
+number, flags, parse code). We send three kinds per picture:
 
-- a **sequence header** (parse code 0x00), sent before the pictures it describes and repeated often enough
-  for receivers that join late (we send it with every picture, 12 bytes at 1080p50);
-- a **picture fragment** of an HQ picture (parse code 0xEC): either the transform parameters of the picture
-  (wavelet, depth, slice counts, prefix bytes, size scaler, quantisation matrix), or a run of **whole
-  slices** with the coordinates of the first one (slice x and y offset) and the slice count;
-- an **end of sequence** (0x10), or padding / auxiliary data, which a receiver may ignore.
+1. the **sequence header** (parse code 0x00, figure 1), with every picture, so a receiver can join at any
+   picture;
+2. a **fragment with the transform parameters** (0xEC, no slices, figure 2): picture number, slice prefix
+   bytes and size scaler in the payload header, then the coded transform parameters;
+3. **fragments with whole slices** (0xEC, figure 3): the same header fields, the fragment length, the number
+   of slices and the position of the first one (slice offset x / y), then the slices as they are in the
+   stream. A packet takes as many whole slices as fit the MTU.
 
-The RTP timestamp (90 kHz) is the same for all packets of a picture, the marker bit is set on the last
-packet of a picture, and the payload header carries the picture number, so a receiver can assign every
-slice to its picture and its place without parsing the packets before it.
+Header usage (sections 4.1, 4.2): the sequence number is 32 bits (low half in the RTP header, high half in
+the payload header); the timestamp is the picture's sampling instant on a 90 kHz clock, the same on all
+packets of a picture including its sequence header; the marker bit is set on the packet with the last slice.
+I / F are 0 (progressive only). End of sequence, auxiliary data and padding packets are not sent and are
+ignored on reception.
 
-Our files and library use the ordinary stream syntax (parse info + sequence header + HQ picture, parse code
-0xE8). The sender splits a picture into fragments; the receiver can feed the decoder either the rebuilt
-picture or, for sub-frame latency, the slice rows as they arrive (see below). Both ends keep the
-transform parameters and slice bytes untouched, so the conversion is a re-framing, not a transcode.
+Files and the encoder use the ordinary stream form (version 2, HQ picture, parse code 0xE8). Fragments are
+a version 3 feature (section 7.1), so the packetiser sends the sequence header as version 3 and writes the
+transform parameters in their version 3 form (two extra flags, both 0); the slice bytes are not touched. The
+receiver rebuilds a picture from the fragments for the decoder. Section 4.4 allows exactly this conversion.
 
-## Consequences for the encoder
+## What the stream must satisfy (section 4.4)
 
-1. **A slice must fit one packet.** Fragments hold whole slices, so the largest slice (1 byte quantiser
-   index + 3 length bytes + the three components) has to stay under the path MTU minus headers: about
-   1400 bytes on a 1500-byte Ethernet path. Our rate control gives every slice the same quantiser and lets
-   the size follow the content, so a busy slice can be several times the mean. For RTP the encoder needs
-   a per-slice cap (raise the index of a slice until it fits). Not implemented yet. At 3 bpp a 128x16 slice
-   is 768 bytes on average and a 64x16 slice 384 bytes, so 64x16 leaves the cap rarely active.
-2. **Truncated slices are plain VC-2**, but some receivers get them wrong (ffmpeg's decoder reads one byte
-   past a short component and can produce a stray coefficient). `--no-truncate` writes every coefficient
-   and costs 5 dB at 3 bpp (it cannot go below about 2.1 bpp at all); use it only towards receivers known
-   to need it.
-3. **Constant bit rate per picture, or per group of slice rows.** `--rc-rows N` spends the budget per N
-   slice rows instead of per picture (0.23 dB at 3 bpp for N = 1). With N = 1 the sender never has to hold
-   more than one slice row before sending, and a ST 2110-21-style narrow sender is possible: packets leave at a
-   constant rate while the picture is still being encoded.
+A slice must fit a packet. `vc2enc --max-slice N` / `vc2_enc_cfg.max_slice_bytes` caps every slice (a
+slice over the cap gets a coarser quantiser); use MTU minus 32 (12 RTP + 4 + 16 payload header). At 3 bpp
+with 128x16 slices and a 1200-byte packet the cap costs 0.06 dB. `vc2_rtp_tx_frame` fails if a slice does
+not fit. Prefix bytes and size scaler stay far below the 16-bit limit.
 
-## Sub-frame latency end to end
+## Receiver
 
-- Encoder: the forward wavelet of a slice row needs the lines of that row plus the filter reach below it
-  (about 30 lines for LeGall 5,3 at depth 4, 60 for Deslauriers-Dubuc 9,7). With `--rc-rows 1` a slice row
-  can be sent as soon as those lines are in. The encoder in this repo works on whole frames; the row-wise
-  variant is the same code driven line by line (open).
-- Network: slice rows arrive in order; with a constant packet rate a 1080p50 picture of 68 slice rows
-  delivers one row every 0.29 ms.
-- Decoder: `vc2_dec_begin` / `vc2_dec_feed` decode every complete slice row on arrival and return the number
-  of finished picture lines. Output trails the input by the same filter reach. On the Firefly the last
-  line is ready 0.65 ms after the last byte of a 1080p50 picture (measured, see the README).
-- Display: a receiver that starts scan-out one filter reach (plus a safety margin) after the first slice
-  row arrives never waits for the whole picture. The player in this repo shows whole frames; a
-  line-locked output needs a genlocked display timing (PTP) and is open.
+- **Reorder window**: packets ahead of the expected sequence number are held; a missing packet is given up
+  when a packet more than `reorder` (default 8) sequence numbers ahead arrives, or on
+  `vc2_rtp_rx_flush` (the caller's timeout). In-order streams are not delayed.
+- **Loss**: slices are placed by their position. Missing slices are replaced by the same slices of the
+  previous picture (their coefficients, re-padded if the size scaler changed), or by empty slices if there
+  is no previous picture. Because slices overlap in the wavelet domain, the replaced area blends into its
+  surroundings. A lost transform parameters packet is rebuilt from the previous picture's and the two fields
+  every fragment carries (section 4.2 allows assuming the parameters unchanged). If the last packets of a
+  picture are lost, the picture is closed by the first packet of the next one or by the flush.
+- **Sub-frame**: every packet's slices go to the cascade decoder at once (`vc2_dec_feed`), so picture
+  lines are ready about 30 lines (LeGall 5,3) behind the slice row received.
+- ST 2022-7: not implemented. The place for it is in front of `vc2_rtp_rx_packet`: packets of both legs can
+  be passed in as they come, since a sequence number already seen is dropped as late.
 
-## Packet loss
+## SDP (section 7.2) and ST 2110-22
 
-Slices are independent in the bit stream, but not in the picture: a lost slice removes its coefficients at
-every wavelet level, so the damage spreads by the filter reach around the slice (wider at the deep levels).
-The decoder zeroes missing slices if told so (not implemented: the index of slices is built from the byte
-stream today; an RTP receiver would pass slice positions explicitly). For ST 2022-7 the two legs merge per
-packet before the decoder (the `dup-merge` crate of srt-2110-gateway does that for our other receivers).
-
-## SDP
+`vc2_rtp_sdp` (`vc2send --sdp`) writes:
 
     m=video 5004 RTP/AVP 96
+    c=IN IP4 127.0.0.1
+    b=AS:310773
     a=rtpmap:96 vc2/90000
-    a=fmtp:96 profile-level-id=...   ; RFC 8450 has no required parameters; the stream describes itself
+    a=fmtp:96 profile=HQ;version=3;level=0;sampling=YCbCr-4:2:2;depth=10;width=1920;height=1080;exactframerate=50;colorimetry=BT709;TCS=SDR;PM=2110GPM;SSN=ST2110-22:2019;TP=2110TPN
+    a=framerate:50
+    a=mediaclk:direct=0
 
-For NMOS (IS-04) the flow is `video/vc2`; there is no ST 2110 part for VC-2, so it runs as an RTP stream
-beside ST 2110-22 (JPEG XS), with the sender's timing (2110-21) declared as for -22 if a receiver needs it.
+`profile`, `version` and `level` are RFC 8450's parameters. The others are what an ST 2110-22 receiver
+expects, as we use them for our JPEG XS streams: the bit rate in `b=AS` (kbit/s), `a=framerate`, the sender
+type `TP`, the standard number `SSN`, the video description in the style of ST 2110-20 (sampling, depth,
+width, height, exactframerate, colorimetry, TCS, PM), and from ST 2110-10 `a=mediaclk:direct=0` and
+`a=ts-refclk` (passed in by the caller; left out by `vc2send`, which has no PTP clock). These names were
+written from our working notes, not checked against the SMPTE documents: check them before interop. The
+colorimetry and `TP=2110TPN` are fixed in the code today; the sender does not shape its packet timing to the
+ST 2110-21 narrow model beyond spreading a picture's packets evenly over the frame period.
 
 ## Open
 
-- per-slice size cap in the rate control;
-- fragmenter / reassembler (sender and receiver side), with slice positions passed to the decoder;
-- concealment of lost slices;
-- any run on the 2110 network: needs a heads-up to its owner and the user's go.
+- A run on a real network (needs the network owner's agreement), multicast, IGMP.
+- ST 2022-7 merge; forward error correction (section 5).
+- A sender that packetises while encoding (`--rc-rows 1` makes the encoder's budget row-wise; the encoder
+  itself still works on whole frames).
+- Timestamps from a PTP media clock (the tools use the system clock) and RTP into the on-screen player.

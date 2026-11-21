@@ -1,6 +1,6 @@
 // vc2play: decodes a VC-2 HQ stream (4:2:2 10-bit) and shows it on a DRM plane as NV20. The decoder writes
 // the packed NV20 lines straight into the scanout buffers (no repack pass); the display controller scales
-// to the screen. Needs DRM master (desktop stopped). The DRM part follows our jxsplay (jxs-endpoint/player).
+// to the screen. Needs DRM master (desktop stopped).
 //
 //   vc2play [--frames N] [--threads N] [--cpus a,b,..] [--conn id --crtc id] [--plane id] [--gpu cl|vk] [--gpu-cpus a,b,..] file.vc2
 // --gpu: the last wavelet level on the GPU, which writes the NV20 lines into the scanout buffers itself (they are
