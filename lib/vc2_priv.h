@@ -34,6 +34,7 @@ void vc2_bw_uint(vc2_bw *b, uint32_t v);
 void vc2_bw_align(vc2_bw *b);
 size_t vc2_write_parse_info(uint8_t *p, int code, uint32_t next, uint32_t prev);
 size_t vc2_write_seq(uint8_t *p, const vc2_seq *s);
+size_t vc2_write_tp(uint8_t *p, const vc2_pic *pic, int major);
 
 // thread pool: run(fn, arg, n) calls fn(arg, job, thread) for job 0..n-1 on all threads, caller included
 typedef struct vc2_pool vc2_pool;

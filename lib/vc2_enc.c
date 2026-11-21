@@ -509,6 +509,14 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
             done += batch;
         }
     }
+    // a slice larger than the cap gets a coarser quantiser until it fits
+    for (int i = 0; e->c.max_slice_bytes > 0 && i < e->nslices; i++) {
+        int row = i / e->nx;
+        while (e->sq[i] < VC2_NQ - 1 && slice_size(e->cb[e->sq[i]] + (size_t)i * 3, e->scaler) > (size_t)e->c.max_slice_bytes) {
+            e->sq[i]++;
+            eval_q(e, e->sq[i], 0, 0, &row, 1);
+        }
+    }
     double t2 = now();
     e->soff[0] = 0;
     e->q_sum = 0;

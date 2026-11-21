@@ -26,6 +26,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--tail")) { c.tail_lambda = atof(v); i++; }
         else if (!strcmp(a, "--q")) { c.fixed_q = atoi(v); i++; }
         else if (!strcmp(a, "--no-truncate")) c.no_truncate = 1;
+        else if (!strcmp(a, "--max-slice")) { c.max_slice_bytes = atoi(v); i++; }
         else if (!strcmp(a, "--fps")) { c.fr_num = atoi(v); i++; }
         else if (!strcmp(a, "--threads")) { c.threads = atoi(v); i++; }
         else if (!strcmp(a, "--chroma")) { c.chroma = atoi(v); i++; }
@@ -43,7 +44,7 @@ int main(int argc, char **argv)
     }
     if (!in || !out) {
         fprintf(stderr, "usage: vc2enc [-s WxH] [--bpp 3] [--wavelet 1] [--depth 4] [--slice 128x16] [--rc-rows 0] [--tail 0.2]\n"
-                        "              [--fps 50] [--threads 1] [--chroma 1] [--loops 1] [--qm list] [--q N] [--no-truncate] in.yuv out.vc2\n"
+                        "              [--fps 50] [--threads 1] [--chroma 1] [--loops 1] [--qm list] [--q N] [--no-truncate] [--max-slice bytes] in.yuv out.vc2\n"
                         "  wavelets: 0 DD 9,7  1 LeGall 5,3  2 DD 13,7  3 Haar  4 Haar (shift)  6 Daubechies 9,7\n");
         return 2;
     }

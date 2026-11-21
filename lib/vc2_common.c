@@ -213,7 +213,7 @@ size_t vc2_write_seq(uint8_t *p, const vc2_seq *s)
     for (int i = 0; i < 21; i++)
         if (base_fmt[i][0] == s->width && base_fmt[i][1] == s->height && !base_fmt[i][3] &&
             frame_rates[base_fmt[i][5]][0] == s->fr_num && frame_rates[base_fmt[i][5]][1] == s->fr_den) base = i;
-    vc2_bw_uint(&b, 2); vc2_bw_uint(&b, 0); vc2_bw_uint(&b, 3); vc2_bw_uint(&b, 0); // version 2.0, HQ profile, level 0
+    vc2_bw_uint(&b, s->major >= 3 ? 3 : 2); vc2_bw_uint(&b, 0); vc2_bw_uint(&b, 3); vc2_bw_uint(&b, 0); // version, HQ profile, level 0
     vc2_bw_uint(&b, base);
     vc2_bw_bit(&b, 1); vc2_bw_uint(&b, s->width); vc2_bw_uint(&b, s->height);
     vc2_bw_bit(&b, 1); vc2_bw_uint(&b, s->chroma);
@@ -228,6 +228,21 @@ size_t vc2_write_seq(uint8_t *p, const vc2_seq *s)
     vc2_bw_bit(&b, 1); vc2_bw_uint(&b, s->bit_depth == 8 ? 2 : s->bit_depth == 10 ? 3 : 4);
     vc2_bw_bit(&b, 0);                                                               // colour: base
     vc2_bw_uint(&b, 0);                                                              // pictures are frames
+    vc2_bw_align(&b);
+    return b.pos >> 3;
+}
+
+// transform parameters as they follow the picture number; version 3 adds the two (unused) asymmetric-transform flags
+size_t vc2_write_tp(uint8_t *p, const vc2_pic *pic, int major)
+{
+    vc2_bw b = { p, 0 };
+    vc2_bw_uint(&b, pic->wavelet); vc2_bw_uint(&b, pic->depth);
+    if (major >= 3) { vc2_bw_bit(&b, 0); vc2_bw_bit(&b, 0); }
+    vc2_bw_uint(&b, pic->slices_x); vc2_bw_uint(&b, pic->slices_y);
+    vc2_bw_uint(&b, pic->prefix_bytes); vc2_bw_uint(&b, pic->size_scaler);
+    vc2_bw_bit(&b, 1);
+    for (int l = 0; l <= pic->depth; l++)
+        for (int o = l ? 1 : 0; o < (l ? 4 : 1); o++) vc2_bw_uint(&b, pic->qm[l][o]);
     vc2_bw_align(&b);
     return b.pos >> 3;
 }

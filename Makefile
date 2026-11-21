@@ -9,7 +9,7 @@ endif
 ifeq ($(ARCH),aarch64)
 CFLAGS += -mcpu=native
 endif
-LIB := $(BUILD)/vc2_common.o $(BUILD)/vc2_dec.o $(BUILD)/vc2_enc.o
+LIB := $(BUILD)/vc2_common.o $(BUILD)/vc2_dec.o $(BUILD)/vc2_enc.o $(BUILD)/vc2_rtp.o
 # GPU path for the decoder's last wavelet level, optional: make GPU=cl (OpenCL on Mali / libmali),
 # GPU=vk (Vulkan compute), GPU="cl vk". Without it nothing here needs OpenCL or Vulkan.
 GPU ?=
@@ -25,7 +25,7 @@ LIB += $(BUILD)/vc2_vk.o
 GPULIBS += -lvulkan
 GLSLC ?= glslc   # or GLSLC="glslangValidator -V"
 endif
-TOOLS := $(BUILD)/vc2enc $(BUILD)/vc2dec $(BUILD)/psnr $(BUILD)/vc2bench
+TOOLS := $(BUILD)/vc2enc $(BUILD)/vc2dec $(BUILD)/psnr $(BUILD)/vc2bench $(BUILD)/vc2send $(BUILD)/vc2recv
 
 all: $(TOOLS)
 $(BUILD):

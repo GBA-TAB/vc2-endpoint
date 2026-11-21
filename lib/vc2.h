@@ -94,6 +94,7 @@ typedef struct {
     double tail_lambda;       // tail truncation strength, 0 = only all-zero tails are dropped
     int fixed_q;              // > 0: constant quantiser index, no rate control (analysis)
     int no_truncate;          // write the zeros of a dropped tail as bits (for decoders that mishandle short components)
+    int max_slice_bytes;      // > 0: no slice larger than this (RTP: a slice must fit one packet)
     int qm_custom;            // 0 = the default matrix of the wavelet (still written into the stream)
     uint8_t qm[VC2_MAX_DEPTH + 1][4];
     int threads;
@@ -109,4 +110,32 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
 // End of sequence (13 bytes), to close a file or a stream.
 size_t vc2_enc_end(vc2_enc *e, uint8_t *out);
 int vc2_enc_last_q(const vc2_enc *e); // mean quantiser index of the last frame, x100
+
+// --- RTP (RFC 8450) -------------------------------------------------------------------------------------
+#define VC2_RTP_OVERHEAD 32 // RTP header + payload header of a slice fragment: the largest slice is mtu - 32
+typedef int (*vc2_rtp_send_fn)(void *ctx, const uint8_t *pkt, size_t len);
+typedef struct vc2_rtp_tx vc2_rtp_tx;
+// mtu = the largest packet handed to send (RTP header included, i.e. the UDP payload size)
+vc2_rtp_tx *vc2_rtp_tx_new(int payload_type, uint32_t ssrc, int mtu);
+void vc2_rtp_tx_free(vc2_rtp_tx *t);
+// Sends one access unit (sequence header + HQ picture, as vc2_enc_encode writes it) as a sequence header
+// packet, a transform parameters packet and slice fragments; the marker is set on the last packet.
+// ts = RTP timestamp (90 kHz). Returns the number of packets, or -1 if a slice does not fit the mtu.
+int vc2_rtp_tx_frame(vc2_rtp_tx *t, const uint8_t *au, size_t len, uint32_t ts, vc2_rtp_send_fn send, void *ctx);
+// SDP media section for a stream (ST 2110-22 style attributes included); returns the length written.
+int vc2_rtp_sdp(char *out, size_t cap, const char *dst_ip, int port, int payload_type, const vc2_seq *s, double bpp, const char *ts_refclk);
+
+typedef struct vc2_rtp_rx vc2_rtp_rx;
+typedef struct { uint64_t packets, late, lost, frames, concealed_slices, dropped_frames; } vc2_rtp_stats;
+// The receiver feeds the decoder slice row by slice row as packets arrive. reorder = how many packets a
+// missing one is waited for (0 = none). Slices lost are replaced by the same slices of the previous frame.
+vc2_rtp_rx *vc2_rtp_rx_new(vc2_dec *d, int reorder);
+void vc2_rtp_rx_free(vc2_rtp_rx *r);
+// Returns 1 when this packet completed a frame (*out is valid until the next packet), 0 otherwise.
+int vc2_rtp_rx_packet(vc2_rtp_rx *r, const uint8_t *pkt, size_t len, vc2_frame *out);
+// Gives up waiting for missing packets and closes the open frame (call on a timeout). Returns like rx_packet.
+int vc2_rtp_rx_flush(vc2_rtp_rx *r, vc2_frame *out);
+int vc2_rtp_rx_lines(const vc2_rtp_rx *r); // finished lines of the frame in progress
+const vc2_rtp_stats *vc2_rtp_rx_stats(const vc2_rtp_rx *r);
+// Hook for ST 2022-7: merge the two legs before vc2_rtp_rx_packet; duplicates (same sequence number) are dropped here.
 #endif
