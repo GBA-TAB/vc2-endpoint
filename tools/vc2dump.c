@@ -258,8 +258,7 @@ int main(int argc, char **argv)
             }
             frame++;
         }
-        pos += n;
-        if (code == VC2_PC_END_SEQ) break;
+        pos += n; // past an end of sequence too: ffmpeg's dirac muxer writes every picture as a sequence of its own
     }
     fprintf(stderr, "%d frames\n", frame);
     return frame ? 0 : 1;

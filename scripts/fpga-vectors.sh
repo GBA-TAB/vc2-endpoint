@@ -59,6 +59,7 @@ mkdir -p $OUT
 add() { # name stream description
     rm -rf $OUT/$1
     $RUN $B/vc2dump "$2" $OUT/$1 $FR > /dev/null 2>&1 || { echo "FAIL dump $1"; return 1; }
+    [ $(ls -d $OUT/$1/f*/ | wc -l) = $FR ] || { echo "FAIL $1: not $FR frames"; return 1; }
     same "$2" $OUT/$1 || { echo "FAIL compare $1"; return 1; }
     cp "$2" $OUT/$1/stream.vc2
     echo "$1: $3; $(sed -n 3p $OUT/$1/f000/params.txt)" >> $OUT/index.txt
