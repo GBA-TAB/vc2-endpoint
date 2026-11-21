@@ -166,3 +166,41 @@ streams plus two outside it, two frames each, each packed as \<name\>.tar.xz wit
   - output of level 1: 5369 (1080p: 5214).
 - **Quantisation indices used:** 0 to 36 (ffmpeg's encoder goes to 36; factor(36) = 2048).
 - **So, measured:** everything still fits 16-bit signed, and the factor table needs at least the indices 0-36.
+
+## 9. Host interface: the H2C stream (format version 0, a proposal)
+
+The host parses the parse info, the sequence header and the transform parameters (`lib/vc2_fpga.c`), and sends
+the card, per picture, a 64-byte descriptor followed by the picture's slice bytes. The card parses only the slices.
+The per-picture values travel with the picture, so no register write has to be timed against DMA progress.
+
+**The descriptor** (little endian):
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 0 | 4 | magic "VC2D" (the bytes 56 43 32 44) |
+| 4 | 1 | version, 0 |
+| 5 | 1 | descriptor length in 16-byte units, 4 |
+| 6 | 2 | flags: bit 0 NEW_SEQ (first picture, or anything below that is fixed per sequence changed: flush) |
+| 8 | 4 | picture number (from the stream) |
+| 12 | 4 | slice bytes: the length of the slice data that follows, without the padding |
+| 16 | 2 + 2 | width, height (luma samples) |
+| 20 | 1 each | chroma (1 = 4:2:2), bit depth, wavelet, depth |
+| 24 | 2 + 2 | slices_x, slices_y |
+| 28 | 2 + 2 | prefix_bytes, size_scaler |
+| 32 | 16 | quantisation matrix: LL, then HL, LH, HH for levels 1..depth (13 used at depth 4), the rest 0 |
+| 48 | 4 | sequence count: +1 with every NEW_SEQ |
+| 52 | 4 | picture count: +1 with every picture the host sends |
+| 56 | 8 | reserved, 0 |
+
+- **After the descriptor:** the slice bytes exactly as in the stream (from the first slice's prefix to the end of
+  the picture), then zeros up to the next multiple of 16 bytes. The next descriptor follows directly.
+- **Fixed per sequence** (NEW_SEQ when one changes): width, height, chroma, bit depth, wavelet, depth, slices_x,
+  slices_y, prefix_bytes. A repeated identical sequence header is no change (ffmpeg repeats it before every
+  picture). **Per picture:** size_scaler and the matrix.
+- **The host only sends what the subset covers** (`vc2_fpga_subset`); anything else stays on the CPU decoder.
+
+**`tools/vc2fpga in.vc2 [out.h2c [pictures]]`** packs a stream, writes the H2C bytes, and checks them with a card
+model: it rebuilds a VC-2 stream from each descriptor and its slice bytes alone, and decodes it against the
+original. Over both vector sets (1080p, 2160p): every picture identical, and exactly the streams outside the
+subset refused (DD 9,7, depth 3, the non-uniform 60x67 slices at 2160p). `fpga-vectors.sh make` puts the H2C
+bytes of the dumped frames in each stream's folder as `stream.h2c`.

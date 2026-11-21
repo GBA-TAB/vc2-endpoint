@@ -5,7 +5,7 @@
 #       every wavelet the subset names and more, depths 1-4, slice sizes, quantisers, truncated or not).
 #   scripts/fpga-vectors.sh make <build dir> <clip.yuv> <width> <height> <out dir> [frames]
 #       the vector set: the streams of the decoder subset, each dumped (default 2 frames), checked, packed
-#       per stream as <name>.tar.xz, plus ranges.txt (largest values over all of them) and an index.
+#       per stream as <name>.tar.xz (with stream.h2c, the card's input, where the card takes it), plus ranges.txt (largest values over all of them) and an index.
 # ffmpeg is needed for the ffmpeg-encoded streams; FFSYNC as in verify.sh.
 set -u
 MODE=$1; B=$2; CLIP=$3; W=$4; H=$5
@@ -62,6 +62,10 @@ add() { # name stream description
     [ $(ls -d $OUT/$1/f*/ | wc -l) = $FR ] || { echo "FAIL $1: not $FR frames"; return 1; }
     same "$2" $OUT/$1 || { echo "FAIL compare $1"; return 1; }
     cp "$2" $OUT/$1/stream.vc2
+    # the H2C stream the host sends the card (docs/FPGA.md section 9), for the streams the card takes
+    $RUN $B/vc2fpga "$2" $OUT/$1/stream.h2c $FR > /dev/null 2>&1; local rc=$?
+    [ $rc = 3 ] && rm -f $OUT/$1/stream.h2c # outside the subset: no card input
+    [ $rc = 0 ] || [ $rc = 3 ] || { echo "FAIL h2c $1"; return 1; }
     echo "$1: $3; $(sed -n 3p $OUT/$1/f000/params.txt)" >> $OUT/index.txt
     (cd $OUT && tar cJf $1.tar.xz $1)
     echo "ok $1"

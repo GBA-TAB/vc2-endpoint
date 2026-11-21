@@ -25,12 +25,13 @@ board; that work is not part of this repo, and no JPEG XS code is.
 | `lib/vc2.h` | public API: stream helpers, decoder (whole frame or fed in pieces), encoder, RTP |
 | `lib/vc2_common.c` | quantiser tables, default matrices, wavelet definitions, headers, thread pool |
 | `lib/vc2_lift.h` | lifting kernels and the strip-wise inverse wavelet (template: 32-bit and 16-bit) |
+| `lib/vc2_fpga.h`, `vc2_fpga.c` | host side of a hardware decoder: subset check, the H2C descriptor (docs/FPGA.md section 9), a card model |
 | `lib/vc2_dec.c`, `lib/vc2_dec_gpu.h` | decoder, and its side of the GPU path |
 | `lib/vc2_cl.c`, `lib/vc2_idwt.cl` | GPU backend: OpenCL (Mali), optional |
 | `lib/vc2_vk.c`, `lib/vc2_idwt.comp` | GPU backend: Vulkan compute, optional |
 | `lib/vc2_enc.c` | encoder |
 | `lib/vc2_rtp.c` | RFC 8450 packetiser and receiver |
-| `tools/` | `vc2enc`, `vc2dec` (to planar yuv), `vc2bench` (speed, CPU, latency), `vc2send` / `vc2recv` (RTP on loopback), `psnr`, `vc2dump` (every decoding stage to files, for a hardware decoder) |
+| `tools/` | `vc2enc`, `vc2dec` (to planar yuv), `vc2bench` (speed, CPU, latency), `vc2send` / `vc2recv` (RTP on loopback), `psnr`, `vc2dump` (every decoding stage to files, for a hardware decoder), `vc2fpga` (the H2C stream for the card, checked by a card model) |
 | `player/vc2play.c` | DRM player (NV20 on the CRTC's primary plane, vblank pacing), `play.sh` |
 | `scripts/verify.sh` | bit-exactness against ffmpeg's decoder |
 | `docs/RTP.md` | the RTP mapping and what is open |
