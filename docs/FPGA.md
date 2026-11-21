@@ -152,3 +152,17 @@ streams plus two outside it, two frames each, each packed as \<name\>.tar.xz wit
 - **Not a proof:** a hostile stream can carry larger values, since a slice can code up to 2^30. The
   hardware should saturate at its width and raise a flag, rather than wrap.
 - **Factor table:** at least the indices 0-30 (factors 4 to 724), better all 116 entries as a ROM.
+
+### 2160p50 4:2:2 10-bit (2026-11-21)
+
+- **The same 11 streams at 3840x2160,** default slices 30x135, 2 frames each, every one dumped and equal to vc2dec
+  (5.4 GB unpacked, 831 MB packed).
+- **Not uniform at 2160p:** 64x32 slices give 60x67 slices (135 rows at level 4 are not divisible by 67), so
+  `ours_53_d4_b3_64x32` is outside the subset at this size.
+- **Largest magnitudes over the subset's streams,** where they differ from 1080p:
+  - dequantised coefficient: 12608 (level 1 LH; 1080p: 11907);
+  - LL: 11061;
+  - level 2: ≤ 9308 dequantised (HH);
+  - output of level 1: 5369 (1080p: 5214).
+- **Quantisation indices used:** 0 to 36 (ffmpeg's encoder goes to 36; factor(36) = 2048).
+- **So, measured:** everything still fits 16-bit signed, and the factor table needs at least the indices 0-36.
