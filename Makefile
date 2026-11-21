@@ -26,7 +26,7 @@ GPULIBS += -lvulkan
 GLSLC ?= glslc   # or GLSLC="glslangValidator -V"
 GLSLC_FLAGS ?= $(if $(findstring glslangValidator,$(GLSLC)),-S comp,-fshader-stage=compute -O)
 endif
-TOOLS := $(BUILD)/vc2enc $(BUILD)/vc2dec $(BUILD)/psnr $(BUILD)/vc2bench $(BUILD)/vc2send $(BUILD)/vc2recv
+TOOLS := $(BUILD)/vc2enc $(BUILD)/vc2dec $(BUILD)/psnr $(BUILD)/vc2bench $(BUILD)/vc2send $(BUILD)/vc2recv $(BUILD)/vc2dump
 
 all: $(TOOLS)
 $(BUILD):

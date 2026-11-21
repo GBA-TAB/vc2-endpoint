@@ -30,10 +30,11 @@ board; that work is not part of this repo, and no JPEG XS code is.
 | `lib/vc2_vk.c`, `lib/vc2_idwt.comp` | GPU backend: Vulkan compute, optional |
 | `lib/vc2_enc.c` | encoder |
 | `lib/vc2_rtp.c` | RFC 8450 packetiser and receiver |
-| `tools/` | `vc2enc`, `vc2dec` (to planar yuv), `vc2bench` (speed, CPU, latency), `vc2send` / `vc2recv` (RTP on loopback), `psnr` |
+| `tools/` | `vc2enc`, `vc2dec` (to planar yuv), `vc2bench` (speed, CPU, latency), `vc2send` / `vc2recv` (RTP on loopback), `psnr`, `vc2dump` (every decoding stage to files, for a hardware decoder) |
 | `player/vc2play.c` | DRM player (NV20 on the CRTC's primary plane, vblank pacing), `play.sh` |
 | `scripts/verify.sh` | bit-exactness against ffmpeg's decoder |
 | `docs/RTP.md` | the RTP mapping and what is open |
+| `docs/FPGA.md` | a hardware (FPGA) decoder: the subset, the exact arithmetic, the reference vectors (`scripts/fpga-vectors.sh`) |
 
 Provenance: all code here was written for this repo. ffmpeg's `vc2enc` / `diracdec` were read as a
 reference and ffmpeg is used as a test oracle (`scripts/verify.sh` runs the `ffmpeg` binary); none of its
