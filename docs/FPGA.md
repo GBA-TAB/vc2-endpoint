@@ -96,12 +96,33 @@ Line-based hardware: level l's output row r needs its band rows up to about r/2 
 deepest level feeds 16 picture lines, so ring buffers of a few slice rows per level are enough (see the
 "cascade" in `lib/vc2_dec.c`). At 2160p that is roughly 0.7-1 MB in all.
 
-## 6. Bit widths
+## 6. Bit widths: the worst case, proven
 
-From `ranges.txt` of the vector set (scripts/fpga-vectors.sh make): the largest magnitudes seen per
-subband, after dequantisation, and per level output. See section 8 for the figures. As a rule, the C code
-runs the deep levels in 32 bits and the last level in 16. The hardware needs the bounds from the vectors
-plus a margin, or saturation with a flag.
+Each coefficient is a separable linear filter of the picture (rounding aside), so its largest magnitude for any
+legal picture is 512 x 2^k x L1(row filter) x L1(column filter) after k analysis levels (samples in [-512, 511],
+the encoder's << 1 per level). `scripts/fpga-worst.py bounds` computes it. `fpga-worst.py picture` builds a picture
+that reaches it: one patch per band and level, each pixel at full scale with the sign of the filter. The vectors
+`worst_53_d4_q1_full` reach every bound within 0.1 %.
+
+| Level (synthesis order) | HL / LH | HH | LL input to this level | Signed bits needed |
+|---|---:|---:|---:|---|
+| 1 (coarsest; LL = the coded LL band) | 38974 | 64440 | 23572 | HL/LH/HH 17, LL 16 |
+| 2 | 19008 | 30976 | 11664 | bands 16, LL 15 |
+| 3 | 8320 | 12800 | 5408 | bands 15, LL 14 |
+| 4 (finest, the widest buffers) | 3072 | 4096 | 2304 | bands 13, LL 13 |
+
+- **16 bits is not enough for every legal picture:** level 1 needs 17 bits. Natural content stays far below
+  (section 8), but full-scale fine patterns (test signals, zone plates, a 1-pixel checkerboard) get there.
+- **Level 4 needs 13 bits, not 12.** 12 bits saturates on a full-scale 1-pixel checkerboard (HH 4092) and on
+  LL inputs above 2047.
+- **Quantisation doesn't push values past these bounds** in our tests (`worstnoisy_53_d4_b3`: quantisers 36-44,
+  every value below the lossless bound), but a hostile stream can carry anything: saturate at the chosen width
+  and raise a flag, never wrap.
+- **Quantisers:** rate-controlled streams of hard content use up to 44 (factor 8192, 14 bits). The factor
+  table should cover all 116 entries.
+- **Inside a lifting step** a sum of two neighbours needs one bit more than the band it reads.
+- **The production decoder** runs only the last level (4) in 16 bits: its inputs are at most 4096 (bands) and
+  2304 (LL), so it is exact for every legal picture (checked: vc2dump = vc2dec on the worst-case vectors).
 
 ## 7. Reference vectors: `tools/vc2dump`
 
@@ -146,8 +167,8 @@ streams plus two outside it, two frames each, each packed as \<name\>.tar.xz wit
 | output of level 1 / 2 / 3 | | 5214 / 2778 / 1363 |
 
 - **Quantisation indices used** (after the matrix): 0 to 30.
-- **So, measured:** every coefficient and every level output fits 16-bit signed with more than a bit of
-  margin. Inside a lifting step the sums are about twice the outputs, which also fits 16 bits for these
+- **So, measured on these streams:** every coefficient and every level output fits 16-bit signed with more than a
+  bit of margin. **Not for every legal picture:** see section 6 (level 1 needs 17 bits). Inside a lifting step the sums are about twice the outputs, which also fits 16 bits for these
   streams. The production decoder runs its last level in 16 bits for the same reason.
 - **Not a proof:** a hostile stream can carry larger values, since a slice can code up to 2^30. The
   hardware should saturate at its width and raise a flag, rather than wrap.
@@ -165,7 +186,8 @@ streams plus two outside it, two frames each, each packed as \<name\>.tar.xz wit
   - level 2: ≤ 9308 dequantised (HH);
   - output of level 1: 5369 (1080p: 5214).
 - **Quantisation indices used:** 0 to 36 (ffmpeg's encoder goes to 36; factor(36) = 2048).
-- **So, measured:** everything still fits 16-bit signed, and the factor table needs at least the indices 0-36.
+- **So, measured on these streams:** everything fits 16-bit signed, and they use the indices 0-36. The worst-case
+  vectors (section 6) need 17 bits at level 1 and use quantisers up to 44.
 
 ## 9. Host interface: the H2C stream (format version 0, a proposal)
 
