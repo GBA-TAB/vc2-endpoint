@@ -46,6 +46,14 @@ that.
    multiply-shift quantiser instead of the float reciprocal (fewer conversions) gave -2 ms on the A76 and +2 ms
    on AVX2, so it was set aside. The levers left: fewer lanes of work (16 bits, step 2), fewer counting passes
    (a better starting quantiser), or the count on the GPU (step 3).
+   **The window, measured (2026-11-23):** counting q - 1 in the same pass as q (identical output, 72 of 72
+   cases) is slower, not faster: Pi 5 one thread 52.6 -> 57.4 ms per frame, Firefly 53.6 -> 60.0 ms; four threads
+   about 4 % fewer frames. The refinement counts q - 1 only for the slice rows its budget can pay for, so counting
+   it for every row costs more than the pass it saves. Dropped.
+   **The quantisation matrix, measured:** the matrix matched to the synthesis L2 weights ({7; 4,4,0; 4,4,0;
+   4,4,1; 6,6,4} against the default {4; 2,2,0; 4,4,2; 5,5,3; 7,7,5}) gives -0.01 to -0.08 dB Y and +-0.02 dB on
+   the average over two natural clips (1080p, UHD) at 1.5-4 bpp; coarser finest-level variants lose up to 0.7 dB.
+   The default stays.
 2. **CPU, 16-bit storage for the finest levels.** The proven bounds (FPGA.md section 6): the finest level's
    bands fit 13 bits, the next 15-16; only the two coarsest need 17. Storing levels 3-4 (three quarters of the
    samples) in 16 bits halves the wavelet's and the counter's memory traffic and doubles the NEON lanes.
