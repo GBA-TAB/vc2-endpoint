@@ -150,27 +150,50 @@ size_t vc2_enc_max_size(const vc2_enc *e)
 int vc2_enc_last_q(const vc2_enc *e) { return (int)(e->q_sum * 100 / e->nslices); }
 
 // --- forward wavelet ---------------------------------------------------------------------------------------
+// One level, line by line: after each input row pair is lifted horizontally, every vertical lifting step runs on
+// the band rows whose inputs are final, so the steps work on rows still in cache instead of sweeping the whole
+// bands once per step (the wavelet is memory-bound on small boards). The arithmetic and its order per row are
+// those of the whole-band version; the steps of every VC-2 wavelet alternate between the two row types.
 static void analyse_level(const vc2_wavelet *wl, const int32_t *in, ptrdiff_t istride, int w, int h, int32_t *bands[4], int32_t *tmp)
 {
     const int ns = wl->nsteps, sh = wl->shift, hw = (w + 2 * VC2_G + 7) & ~7;
     int32_t *lo = tmp + VC2_G, *hi = tmp + hw + VC2_G;
-    for (int y = 0; y < 2 * h; y++) {
-        const int32_t *r = in + (size_t)y * istride;
-        for (int x = 0; x < w; x++) { lo[x] = r[2 * x] << sh; hi[x] = r[2 * x + 1] << sh; }
-        for (int j = ns - 1; j >= 0; j--) vc2_lift_h_32(lo, hi, w, &wl->st[j], -wl->st[j].sign);
-        memcpy(bands[(y & 1) * 2] + (size_t)(y / 2) * w, lo, w * 4);
-        memcpy(bands[(y & 1) * 2 + 1] + (size_t)(y / 2) * w, hi, w * 4);
-    }
+    int done[5] = { 0 }, rlo[5], rhi[5], tg[5];
+    for (int k = 1; k <= ns; k++) { const vc2_step *st = &wl->st[ns - k]; tg[k] = st->tgt; vc2_step_reach(st, &rlo[k], &rhi[k]); }
 #define CLAMP(i) ((i) < 0 ? 0 : (i) >= h ? h - 1 : (i))
-    for (int j = ns - 1; j >= 0; j--) {
-        const vc2_step *s = &wl->st[j];
-        int t = s->tgt, off = t ? -1 : -2;
-        for (int half = 0; half < 2; half++) {
-            int32_t *tb = bands[t * 2 + half];
-            const int32_t *ob = bands[!t * 2 + half];
-            for (int i = 0; i < h; i++)
-                vc2_lift_32(tb + (size_t)i * w, tb + (size_t)i * w, ob + (size_t)CLAMP(i + off) * w, ob + (size_t)CLAMP(i + off + 1) * w,
-                            ob + (size_t)CLAMP(i + off + 2) * w, ob + (size_t)CLAMP(i + off + 3) * w, w, s, -s->sign);
+    for (int p = 0; p <= h; p++) {
+        if (p < h) {
+            for (int y = 2 * p; y < 2 * p + 2; y++) {
+                const int32_t *r = in + (size_t)y * istride;
+                for (int x = 0; x < w; x++) { lo[x] = r[2 * x] << sh; hi[x] = r[2 * x + 1] << sh; }
+                for (int j = ns - 1; j >= 0; j--) vc2_lift_h_32(lo, hi, w, &wl->st[j], -wl->st[j].sign);
+                memcpy(bands[(y & 1) * 2] + (size_t)(y / 2) * w, lo, w * 4);
+                memcpy(bands[(y & 1) * 2 + 1] + (size_t)(y / 2) * w, hi, w * 4);
+            }
+            done[0] = p + 1;
+        }
+        for (int k = 1; k <= ns; k++) {
+            const vc2_step *st = &wl->st[ns - k];
+            const int t = tg[k], off = t ? -1 : -2;
+            for (;;) {
+                int i = done[k];
+                if (i >= h) break;
+                // the other row type, as the previous step (or the horizontal pass) left it
+                int need = i + rhi[k] > h - 1 ? h - 1 : i + rhi[k];
+                if (done[k - 1] <= need) break;
+                // the previous step read this row type: all its rows that read row i must be done
+                if (k >= 2) {
+                    int last = i - rlo[k - 1];
+                    if ((last >= h - 1 || i == h - 1) ? done[k - 1] < h : done[k - 1] <= last) break;
+                }
+                for (int half = 0; half < 2; half++) {
+                    int32_t *tb = bands[t * 2 + half];
+                    const int32_t *ob = bands[!t * 2 + half];
+                    vc2_lift_32(tb + (size_t)i * w, tb + (size_t)i * w, ob + (size_t)CLAMP(i + off) * w, ob + (size_t)CLAMP(i + off + 1) * w,
+                                ob + (size_t)CLAMP(i + off + 2) * w, ob + (size_t)CLAMP(i + off + 3) * w, w, st, -st->sign);
+                }
+                done[k] = i + 1;
+            }
         }
     }
 #undef CLAMP

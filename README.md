@@ -131,13 +131,23 @@ Speed on the x86 host (i7-7800X, two cores at nice 19, shared with other work), 
 | 1080p 2 bpp, LeGall | 17.7 ms | 31 ms | 57 |
 | 1080p 3 bpp, DD 9,7 | 22.0 ms | 37 ms | 46 |
 | 1080p 3 bpp, one thread | 31.5 ms | 31.5 ms | 32 |
-| Raspberry Pi 5 (4 x A76, 2.4 GHz), 1080p 3 bpp, 2 / 4 threads | 40.2 / 33.3 ms | 79 / 98 ms | 24.9 / 30.1 |
+| Raspberry Pi 5 (4 x A76, 2.4 GHz), 1080p 3 bpp, 1 / 4 threads | 51.8 / 25.2 ms | 52 / 75 ms | 19.3 / 39.7 |
+| Firefly (RK3588, 4 x A76 at 2.0 GHz), 1080p 3 bpp, 1 / 4 threads | 53.2 / 18.4 ms | 53 / 58 ms | 18.8 / 54.3 |
 | UHD 3 bpp | 86 ms | 156 ms | 11.6 |
 
 So 1080p50 in real time on the two cores holds up to about 2.5 bpp and is at the limit at 3 bpp; UHD50 would
 need about eight such cores. (An AVX-512 build gains nothing: the time is in memory order and the
 bit writer, not in vector width.) Where the time goes at 3 bpp, one thread, roughly: wavelet 9 ms, counting
 13 ms (two passes), writing 9 ms.
+
+On the small boards the forward wavelet was memory-bound: the whole-band version swept every band once per
+lifting step, and on the Pi 5 it took 18.7 ms per 1080p frame whatever the number of threads (spreading it over
+more threads changed nothing). It now runs line by line: after each input row pair is lifted horizontally, each
+vertical step runs on the band rows whose inputs are final, while they are still in cache. Same arithmetic, the
+same bytes out (checked against the previous encoder for all six wavelets, depths 1-5, 1 and 3 threads, sizes
+64x34 to 3840x2160). Pi 5: wavelet 18.7 -> 12.5 ms, 4 threads 29.6 -> 39.7 fps; Firefly: 7.6 -> 6.6 ms, 51.2 ->
+54.3 fps, so the RK3588 encodes 1080p50 at 3 bpp on its four A76 cores. Single thread, the rate control's
+counting (24 ms) and the writer (12-14 ms) are now most of the time.
 
 ## 3. Decoder
 
