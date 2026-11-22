@@ -131,6 +131,7 @@ Speed on the x86 host (i7-7800X, two cores at nice 19, shared with other work), 
 | 1080p 2 bpp, LeGall | 17.7 ms | 31 ms | 57 |
 | 1080p 3 bpp, DD 9,7 | 22.0 ms | 37 ms | 46 |
 | 1080p 3 bpp, one thread | 31.5 ms | 31.5 ms | 32 |
+| Raspberry Pi 5 (4 x A76, 2.4 GHz), 1080p 3 bpp, 2 / 4 threads | 40.2 / 33.3 ms | 79 / 98 ms | 24.9 / 30.1 |
 | UHD 3 bpp | 86 ms | 156 ms | 11.6 |
 
 So 1080p50 in real time on the two cores holds up to about 2.5 bpp and is at the limit at 3 bpp; UHD50 would
@@ -366,7 +367,7 @@ placed by position, lost slices replaced by those of the previous picture, and e
 the decoder at once. `docs/RTP.md` has the mapping, the SDP and what is open. The encoder caps the slice size
 for this (`--max-slice`, 0.06 dB at 3 bpp for 1200-byte packets).
 
-Tested on the board's own loopback interface only (sender on one A76 core, receiver and decoder on another),
+Tested first on the board's own loopback interface (sender on one A76 core, receiver and decoder on another),
 1080p50 at 3 bpp, 910 packets per frame spread over the frame period, 300 frames:
 
 | Case | lost packets | concealed slices | first packet to last line, avg / max | last packet to last line, avg / max | PSNR Y against a clean decode (20 frames) |
@@ -386,9 +387,29 @@ conceals better. The receiver needs a socket buffer larger than the usual 208 kB
 (`vc2recv` asks for 8 MB, which needs CAP_NET_ADMIN or a raised `net.core.rmem_max`), or packets are lost
 whenever the decoder is busy for more than 0.7 ms.
 
+Over the office network (2026-11-22; 1 GbE switched LAN, MTU 1500, unicast, no PTP: the sender's system clock
+gives the timestamps), the same clip and settings, 500 frames each way, the receiver as root for its 8 MB socket
+buffer:
+
+| Sender -> receiver | lost | first packet to last line, avg / max | last packet to last line, avg / max | arrival jitter (spread / sd) | receiver CPU |
+|---|---:|---|---|---|---:|
+| x86 host -> Firefly | 0 | 19.99 / 27.58 ms | 0.36 / 0.39 ms | 7.65 / 0.85 ms | 16.1 ms/frame |
+| x86 host -> Pi 5 | 0 | 19.97 / 25.30 ms | 0.31 / 0.50 ms | 7.04 / 1.02 ms | 13.7 ms/frame |
+| Firefly -> Pi 5 | 0 | 19.97 / 21.19 ms | 0.31 / 0.44 ms | 12.45 / 0.62 ms | 13.8 ms/frame |
+| Pi 5 -> Firefly | 0 | 20.00 / 20.13 ms | 0.36 / 0.39 ms | 0.61 / 0.04 ms | 16.1 ms/frame |
+| x86 host -> Firefly, packets in a tenth of the period | 0 | 16.15 / 33.05 ms | 0.36 / 0.38 ms | 13.86 / 1.11 ms | 16.1 ms/frame |
+
+No packet was lost or late in any run, and the decoder stays 0.3-0.4 ms behind the last packet, as on loopback.
+The arrival jitter is the sender's: an idle Pi 5 paces within 0.6 ms, the busy x86 host (a shared core, normal
+scheduling) and the Firefly show single late frames of 7-14 ms. A real sender paces from a real-time thread.
+
     build/vc2enc --bpp 3 --max-slice 1168 in.yuv rtp.vc2
     sudo taskset -c 5 build/vc2recv --port 5870 --frames 300 --out rx.yuv --out-skip 200 --out-frames 20 &
     taskset -c 6 build/vc2send --port 5870 --frames 300 [--loss 5] [--reorder 50] [--spread 0.1] rtp.vc2
+    # over a network: the receiver binds its address (or 0.0.0.0), the sender needs --network for a unicast
+    # destination outside loopback; multicast, broadcast and 172.30.3.0/24 are refused
+    sudo taskset -c 5 build/vc2recv --bind 0.0.0.0 --port 5872 --frames 500 &
+    build/vc2send --network --dst 192.168.98.162 --port 5872 --frames 500 rtp.vc2
     build/vc2send --sdp rtp.vc2
 
 ## 8. Open
@@ -397,7 +418,7 @@ whenever the decoder is busy for more than 0.7 ms.
   VC-2 against JPEG XS by eye, not by PSNR.
 - UHD: more headroom (the entropy decoding is now 2/3 of the CPU time), a fan, the Vulkan path on real
   hardware, a frame-in-flight mode if latency allows.
-- RTP: a run on a real network, ST 2022-7, PTP timestamps, RTP into the player (see `docs/RTP.md`).
+- RTP: ST 2022-7, PTP timestamps, RTP into the player, a sender with a real-time thread (see `docs/RTP.md`).
 - Encoder: 3 bpp at 1080p50 is at the limit of two x86 cores; a 16-bit forward wavelet and a row-wise
   (sub-frame) mode are the next steps. Its latency today is one frame.
 - Line-locked display (scan-out following the decoder by a fixed number of lines) for a true sub-frame

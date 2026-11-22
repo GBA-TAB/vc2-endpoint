@@ -1,8 +1,10 @@
-// vc2recv: receives a VC-2 RTP stream (RFC 8450) on a loopback UDP port, decodes it as the packets arrive and
-// reports the latency. Binds 127.0.0.1 only.
-//   vc2recv [--port 5004] [--frames 500] [--reorder 8] [--cpu N] [--out f.yuv] [--out-frames 4] [--out-skip 0]
+// vc2recv: receives a VC-2 RTP stream (RFC 8450) on a UDP port, decodes it as the packets arrive and reports the
+// latency. Binds 127.0.0.1 unless --bind names a local unicast address (or 0.0.0.0).
+//   vc2recv [--bind 127.0.0.1] [--port 5004] [--frames 500] [--reorder 8] [--cpu N] [--threads 1] [--cpus a,b]
+//           [--out f.yuv] [--out-frames 4] [--out-skip 0]
 // Latency per frame: from the arrival of its first packet to its last line being decoded, and from the
-// arrival of its last packet to the same.
+// arrival of its last packet to the same. Over a network also the arrival jitter: the spread of the first
+// packets' arrival around the 90 kHz timestamps (no common clock needed, only the same rate).
 #define _GNU_SOURCE
 #include "../lib/vc2.h"
 #include <arpa/inet.h>
@@ -19,8 +21,8 @@ static double cpu(void) { struct timespec t; clock_gettime(CLOCK_PROCESS_CPUTIME
 
 int main(int argc, char **argv)
 {
-    int port = 5004, frames = 500, reorder = 8, pin = -1, out_frames = 4, out_skip = 0;
-    const char *out = 0;
+    int port = 5004, frames = 500, reorder = 8, pin = -1, out_frames = 4, out_skip = 0, threads = 1, cpus[64], ncpu = 0;
+    const char *out = 0, *bind_ip = "127.0.0.1";
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : "";
         if (!strcmp(a, "--port")) { port = atoi(v); i++; }
@@ -30,20 +32,27 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--out")) { out = v; i++; }
         else if (!strcmp(a, "--out-frames")) { out_frames = atoi(v); i++; }
         else if (!strcmp(a, "--out-skip")) { out_skip = atoi(v); i++; }
+        else if (!strcmp(a, "--bind")) { bind_ip = v; i++; }
+        else if (!strcmp(a, "--threads")) { threads = atoi(v); i++; }
+        else if (!strcmp(a, "--cpus")) { for (const char *c = v; *c && ncpu < 64;) { cpus[ncpu++] = atoi(c); while (*c && *c != ',') c++; if (*c) c++; } i++; }
     }
+    if (threads < 1 || (ncpu && ncpu < threads)) { fprintf(stderr, "--threads / --cpus\n"); return 2; }
     if (pin >= 0) { cpu_set_t set; CPU_ZERO(&set); CPU_SET(pin, &set); sched_setaffinity(0, sizeof set, &set); }
     int fd = socket(AF_INET, SOCK_DGRAM, 0), rcvbuf = 8 << 20;
-    struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    struct sockaddr_in me = { .sin_family = AF_INET, .sin_port = htons(port) };
+    if (inet_pton(AF_INET, bind_ip, &me.sin_addr) != 1 || (ntohl(me.sin_addr.s_addr) >> 28) == 14) { fprintf(stderr, "--bind: a local unicast IPv4 address\n"); return 2; }
     struct timeval tv = { 0, 100000 };
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
     setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof rcvbuf); // beyond net.core.rmem_max: needs CAP_NET_ADMIN
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     if (bind(fd, (struct sockaddr *)&me, sizeof me)) { perror("bind"); return 1; }
-    vc2_dec *d = vc2_dec_new(1, 0);
+    vc2_dec *d = vc2_dec_new(threads, ncpu ? cpus : 0);
     vc2_rtp_rx *rx = vc2_rtp_rx_new(d, reorder);
     FILE *fo = out ? fopen(out, "wb") : 0;
     uint8_t pkt[9216];
-    uint32_t cur_ts = 0;
+    uint32_t cur_ts = 0, ts0 = 0;
+    double jmin = 1e9, jmax = -1e9, jsum = 0, jsq = 0; // first-packet arrival minus its timestamp, against the first frame
+    long jn = 0;
     double t_first = 0, l1 = 0, l1max = 0, l2 = 0, l2max = 0, c0 = cpu(), t_begin = 0;
     int got = 0, idle = 0, any = 0;
     uint8_t *keep = 0;
@@ -58,8 +67,14 @@ int main(int argc, char **argv)
             if (any && ++idle > 30) break;
         } else {
             uint32_t ts = (uint32_t)pkt[4] << 24 | pkt[5] << 16 | pkt[6] << 8 | pkt[7];
-            if (!any || ts != cur_ts) { cur_ts = ts; t_first = t; }
-            if (!any) { any = 1; t_begin = t; c0 = cpu(); }
+            if (!any) { any = 1; t_begin = t; c0 = cpu(); ts0 = ts; }
+            if (jn == 0 || ts != cur_ts) {
+                cur_ts = ts; t_first = t;
+                double j = (t - t_begin) - (double)(uint32_t)(ts - ts0) / 90000.0;
+                jsum += j; jsq += j * j; jn++;
+                if (j < jmin) jmin = j;
+                if (j > jmax) jmax = j;
+            }
             idle = 0;
             done = vc2_rtp_rx_packet(rx, pkt, n, &f);
         }
@@ -83,6 +98,11 @@ int main(int argc, char **argv)
            (unsigned long long)s->lost, (unsigned long long)s->late, (unsigned long long)s->concealed_slices, (unsigned long long)s->dropped_frames);
     printf("first packet -> last line: avg %.2f max %.2f ms; last packet -> last line: avg %.2f max %.2f ms; cpu %.2f ms/frame over %.1f s\n",
            l1 / m * 1e3, l1max * 1e3, l2 / m * 1e3, l2max * 1e3, (cpu() - c0) / (got ? got : 1) * 1e3, now() - t_begin);
+    if (jn > 1) {
+        double mean = jsum / jn, sd = jsq / jn - mean * mean;
+        printf("first-packet arrival against the timestamps: spread %.2f ms (min %.2f, max %.2f, sd %.3f ms; drift included)\n",
+               (jmax - jmin) * 1e3, jmin * 1e3, jmax * 1e3, (sd > 0 ? __builtin_sqrt(sd) : 0) * 1e3);
+    }
     if (fo) { fwrite(keep, 1, keep_n, fo); fclose(fo); }
     return 0;
 }

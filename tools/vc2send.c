@@ -1,12 +1,15 @@
-// vc2send: sends a VC-2 file as RTP (RFC 8450) over UDP, paced. Loopback only: any other destination is refused
-// (media on a real network is a decision for the network's owner).
-//   vc2send [--port 5004] [--fps 50] [--frames 500] [--mtu 1200] [--spread 1.0] [--loss permille] [--reorder permille]
-//           [--sdp] file.vc2
+// vc2send: sends a VC-2 file as RTP (RFC 8450) over UDP, paced.
+//   vc2send [--dst 127.0.0.1] [--port 5004] [--fps 50] [--frames 500] [--mtu 1200] [--spread 1.0] [--loss permille]
+//           [--reorder permille] [--cpu N] [--sdp] file.vc2
+// --dst: loopback by default. A unicast address outside 127/8 needs --network as well (media on a real network is
+// a decision for the network's owner); multicast, broadcast and the lab media network 172.30.3.0/24 (ST 2110,
+// PTP) are always refused.
 // --spread: the fraction of the frame period over which a frame's packets are sent (1 = constant rate).
 // --loss / --reorder: drop packets, or swap a packet with the next, at random (seeded, repeatable).
 #define _GNU_SOURCE
 #include "../lib/vc2.h"
 #include <arpa/inet.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +30,7 @@ static int collect(void *ctx, const uint8_t *p, size_t n) { (void)ctx; memcpy(q[
 
 int main(int argc, char **argv)
 {
-    int port = 5004, frames = 500, mtu = 1200, loss = 0, reorder = 0, sdp = 0;
+    int port = 5004, frames = 500, mtu = 1200, loss = 0, reorder = 0, sdp = 0, network = 0, pin = -1;
     double fps = 50, spread = 1;
     const char *in = 0, *dst = "127.0.0.1";
     for (int i = 1; i < argc; i++) {
@@ -40,12 +43,20 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--loss")) { loss = atoi(v); i++; }
         else if (!strcmp(a, "--reorder")) { reorder = atoi(v); i++; }
         else if (!strcmp(a, "--dst")) { dst = v; i++; }
+        else if (!strcmp(a, "--network")) network = 1;
+        else if (!strcmp(a, "--cpu")) { pin = atoi(v); i++; }
         else if (!strcmp(a, "--sdp")) sdp = 1;
         else in = a;
     }
-    if (!in) { fprintf(stderr, "usage: vc2send [--port 5004] [--fps 50] [--frames N] [--mtu 1200] [--spread 1.0] [--loss permille] [--reorder permille] [--sdp] file.vc2\n"); return 2; }
+    if (!in) { fprintf(stderr, "usage: vc2send [--dst A [--network]] [--port 5004] [--fps 50] [--frames N] [--mtu 1200] [--spread 1.0] [--loss permille] [--reorder permille] [--cpu N] [--sdp] file.vc2\n"); return 2; }
     struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(port) };
-    if (inet_pton(AF_INET, dst, &to.sin_addr) != 1 || (ntohl(to.sin_addr.s_addr) >> 24) != 127) { fprintf(stderr, "only loopback destinations (127.x.x.x) are allowed\n"); return 2; }
+    if (inet_pton(AF_INET, dst, &to.sin_addr) != 1) { fprintf(stderr, "--dst: not an IPv4 address\n"); return 2; }
+    uint32_t ip = ntohl(to.sin_addr.s_addr);
+    if (ip >> 28 == 14 || ip >> 28 == 15 || (ip & 0xff) == 255 || (ip & 0xff) == 0 || ip >> 8 == (172u << 16 | 30 << 8 | 3)) {
+        fprintf(stderr, "multicast, broadcast and the lab media network 172.30.3.0/24 are refused\n"); return 2;
+    }
+    if (ip >> 24 != 127 && !network) { fprintf(stderr, "a destination outside loopback needs --network\n"); return 2; }
+    if (pin >= 0) { cpu_set_t set; CPU_ZERO(&set); CPU_SET(pin, &set); sched_setaffinity(0, sizeof set, &set); }
     FILE *fi = fopen(in, "rb");
     if (!fi) { perror(in); return 1; }
     fseek(fi, 0, SEEK_END);
