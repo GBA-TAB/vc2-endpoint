@@ -121,6 +121,11 @@ that reaches it: one patch per band and level, each pixel at full scale with the
 - **Quantisers:** rate-controlled streams of hard content use up to 44 (factor 8192, 14 bits). The factor
   table should cover all 116 entries.
 - **Inside a lifting step** a sum of two neighbours needs one bit more than the band it reads.
+- **Signed values stored in RAM: write the sign extension out.** On the card's first run (2026-11-22) the band
+  buffers of levels 2-4 were `reg signed [15:0]` arrays read into an 18-bit `reg signed`: xsim sign-extended the
+  read, Vivado 2025.1's block-RAM inference zero-extended it, so the netlist differed from the RTL simulation
+  (65507 instead of -29). Store such arrays unsigned and extend by hand (`{{2{r[15]}}, r}`), and check every
+  inferred RAM by a netlist simulation (`write_verilog -mode funcsim`), not only by the RTL.
 - **The production decoder** runs only the last level (4) in 16 bits: its inputs are at most 4096 (bands) and
   2304 (LL), so it is exact for every legal picture (checked: vc2dump = vc2dec on the worst-case vectors).
 
@@ -246,8 +251,9 @@ bytes of the dumped frames in each stream's folder as `stream.h2c`.
   through the card model and the CPU decoder into interleaved NV20, with back-pressure, the status block, and the
   card's error flags, behaving as the RTL does (pmod-b3, 2026-11-21):
   - ERR_MAGIC, ERR_FORMAT, ERR_OVERRUN: the card stops at that descriptor and puts nothing out for it. The
-    pictures before it come out complete, and it takes no data until `vc2x_reset`. On the card a send blocks
-    until the xdma driver's 10 s timeout; the model fails it at once with EIO.
+    pictures before it come out complete. Until `vc2x_reset`, sends succeed and their data is discarded, and a
+    `vc2x_recv` that finds nothing left fails at once with EIO (SLVERR on the card; the DMA never hangs).
+    The model does the same.
   - ERR_GEOM (more than 8 level-4 rows per slice row, e.g. 64x32 slices): a full-length picture with undefined
     content (the model's is correct), and the flag stays until reset.
 - **`tools/vc2xbench [--dev D] [--frames N] [--fps F] [--piece N] [--send-cpu C] [--recv-cpu C] in.vc2`** sends a
@@ -256,4 +262,13 @@ bytes of the dumped frames in each stream's folder as `stream.h2c`.
   - Through the model: all subset streams of both vector sets identical, and ERR_GEOM on 64x32 at 1080p.
   - 1080p50 paced: 200 of 200 pictures on caspar; 100 of 100 on the Orange Pi (model on A76 cores 5-6,
     receiver on 4).
-  - The same command with `--dev /dev/xdma0` is the first test on the card.
+- **On the card** (pmod-b3, 2026-11-22T1045Z; m2vc2 0xb5b464e6 on the M.2 Artix-7, Orange Pi 5 Plus, PCIe 5 GT/s
+  x4, MaxPayload 128): all 10 subset streams at 1080p bit-exact; 64x32 slices give ERR_GEOM as expected; 3000
+  pictures at `--fps 50`: 3000 of 3000 bit-exact, 50.00 pictures/s, 259 MB/s out, first lines 1.01 ms and the last
+  line 17.29 ms (max 30.34) after the send start, 1.5 ms of CPU per picture, die at most 56.7 °C.
+- **The CPU clock of the sending and receiving cores must stay high.** Both threads mostly wait in the xdma driver,
+  so the `ondemand` governor drops the A76 pair 4-5 to 600 MHz within 2 s, and the driver's per-transfer overhead
+  then caps the rate at about 40 pictures/s. At 2.26 GHz (`performance` on policy4) 50/s holds. A player on the
+  card (vc2play `--fpga`) needs `performance` or a raised `scaling_min_freq` on the policy of its two cores;
+  whether that becomes a lasting setting on the board is the user's decision. A receive piece of 16 line pairs is
+  best (1080 gives 52.7/s at full clock).

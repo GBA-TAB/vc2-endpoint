@@ -9,8 +9,9 @@
 //   - the status block: picture count and luma lines of the picture being output, pictures completed, the flags;
 //   - VC2X_ERR_MAGIC (no descriptor where one must start), VC2X_ERR_FORMAT (a picture outside the subset) and
 //     VC2X_ERR_OVERRUN (the slices run past the descriptor's slice bytes): the card stops at that descriptor and
-//     puts nothing out for it; the pictures before it come out complete; it takes no H2C data until vc2x_reset
-//     (a send blocks until the xdma driver's 10 s timeout). The model fails such sends at once with EIO.
+//     puts nothing out for it; the pictures before it come out complete. Until vc2x_reset the H2C writes complete
+//     and their data is discarded, and a C2H read that finds nothing left fails at once with EIO (SLVERR on the
+//     card; pmod-b3, 2026-11-22T0125Z). The model does the same.
 //   - VC2X_ERR_GEOM: more than 8 level-4 rows per slice row (the card's band buffers). The card puts out a
 //     full-length picture with undefined content, the model a correct one; the flag stays until reset.
 //   VC2X_SATURATED is never set: the CPU decoder computes at full width.
@@ -101,7 +102,7 @@ static int m_send(vc2x *x, const void *buf, size_t len)
     if (len % 16) { errno = EINVAL; return -1; }
     pthread_mutex_lock(&m->mu);
     uint32_t gen = m->gen;
-    if (m->lost) { pthread_mutex_unlock(&m->mu); errno = EIO; return -1; } // the card takes nothing until a reset
+    if (m->lost) { pthread_mutex_unlock(&m->mu); return 0; } // the card discards H2C data until a reset
     if (m->in_len + len > m->in_cap) {
         size_t cap = (m->in_len + len) * 2;
         uint8_t *n = realloc(m->in, cap);
@@ -119,6 +120,7 @@ static int m_send(vc2x *x, const void *buf, size_t len)
         m->in_len -= used;
         if (m->lost) { m->in_len = 0; break; }
     }
+    if (m->lost) pthread_cond_broadcast(&m->cv); // a waiting recv with nothing left fails now
     pthread_mutex_unlock(&m->mu);
     return 0;
 }
@@ -130,8 +132,9 @@ static int m_recv(vc2x *x, void *buf, size_t len)
     pthread_mutex_lock(&m->mu);
     uint32_t gen = m->gen;
     while (len) {
-        while (!m->head && gen == m->gen) pthread_cond_wait(&m->cv, &m->mu);
+        while (!m->head && !m->lost && gen == m->gen) pthread_cond_wait(&m->cv, &m->mu);
         if (gen != m->gen) { pthread_mutex_unlock(&m->mu); errno = ECANCELED; return -1; }
+        if (!m->head) { pthread_mutex_unlock(&m->mu); errno = EIO; return -1; } // stopped, nothing left (SLVERR)
         pic *p = m->head;
         if (len % p->pair) { pthread_mutex_unlock(&m->mu); errno = EINVAL; return -1; }
         size_t n = p->len - p->pos < len ? p->len - p->pos : len;
