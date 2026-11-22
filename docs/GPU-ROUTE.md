@@ -39,6 +39,13 @@ that.
    directly from the value, so one pass can produce each slice's bits for a window of quantisers around the
    last frame's (say q-1 .. q+2) while the coefficients are read once. Expected: counting from ~24 ms to
    ~10 ms on one A76. Byte-identical output is the check (the rate control sees the same numbers).
+   **Measured first (2026-11-22, Pi 5, one thread):** one counting pass is 9.8 ms, of which about 8.8 ms is the
+   per-coefficient loop (vectorised; about 5 cycles per coefficient) and 0.4 ms the truncation search. At
+   about 1.6 GB/s it is arithmetic-bound, not memory-bound, so reading the coefficients once for several
+   quantisers saves less than hoped: what costs is the work per coefficient and quantiser. An integer
+   multiply-shift quantiser instead of the float reciprocal (fewer conversions) gave -2 ms on the A76 and +2 ms
+   on AVX2, so it was set aside. The levers left: fewer lanes of work (16 bits, step 2), fewer counting passes
+   (a better starting quantiser), or the count on the GPU (step 3).
 2. **CPU, 16-bit storage for the finest levels.** The proven bounds (FPGA.md section 6): the finest level's
    bands fit 13 bits, the next 15-16; only the two coarsest need 17. Storing levels 3-4 (three quarters of the
    samples) in 16 bits halves the wavelet's and the counter's memory traffic and doubles the NEON lanes.
