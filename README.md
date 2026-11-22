@@ -36,6 +36,7 @@ board; that work is not part of this repo, and no JPEG XS code is.
 | `player/vc2play.c` | DRM player (NV20 on the CRTC's primary plane, vblank pacing), `play.sh` |
 | `scripts/verify.sh` | bit-exactness against ffmpeg's decoder |
 | `docs/RTP.md` | the RTP mapping and what is open |
+| `docs/GPU-ROUTE.md` | the GPU plan: encoder steps on the RK3588 boards (libmali), then CUDA for streams per GPU (memory, entropy, PCIe limits) |
 | `docs/FPGA.md` | a hardware (FPGA) decoder: the subset, the exact arithmetic, the reference vectors (`scripts/fpga-vectors.sh`) |
 
 Provenance: all code here was written for this repo. ffmpeg's `vc2enc` / `diracdec` were read as a
