@@ -132,8 +132,8 @@ Speed on the x86 host (i7-7800X, two cores at nice 19, shared with other work), 
 | 1080p 2 bpp, LeGall | 17.7 ms | 31 ms | 57 |
 | 1080p 3 bpp, DD 9,7 | 22.0 ms | 37 ms | 46 |
 | 1080p 3 bpp, one thread | 31.5 ms | 31.5 ms | 32 |
-| Raspberry Pi 5 (4 x A76, 2.4 GHz), 1080p 3 bpp, 1 / 4 threads | 51.8 / 25.2 ms | 52 / 75 ms | 19.3 / 39.7 |
-| Firefly (RK3588, 4 x A76 at 2.0 GHz), 1080p 3 bpp, 1 / 4 threads | 53.2 / 18.4 ms | 53 / 58 ms | 18.8 / 54.3 |
+| Raspberry Pi 5 (4 x A76, 2.4 GHz), 1080p 3 bpp, 1 / 4 threads | 44.2 / 18.0 ms | 44 / 57 ms | 22.6 / 55.6 |
+| Firefly (RK3588, 4 x A76 at 2.0 GHz), 1080p 3 bpp, 1 / 4 threads | 46.4 / 15.3 ms | 46 / 49 ms | 21.5 / 65.4 |
 | UHD 3 bpp | 86 ms | 156 ms | 11.6 |
 
 So 1080p50 in real time on the two cores holds up to about 2.5 bpp and is at the limit at 3 bpp; UHD50 would
@@ -151,6 +151,24 @@ same bytes out (checked against the previous encoder for all six wavelets, depth
 counting (24 ms) and the writer (12-14 ms) are now most of the time. The writer collects short codes in a local
 word and stores them a few at a time, with one table lookup for two small values (|v| <= 7): 12.0 -> 9.9 ms on a
 Pi 5 core, 14.1 -> 12.0 ms on the Firefly, 8.5 -> 7.7 ms on x86, the same bytes out (99 cases).
+
+**16 bits for the two finest levels** (LeGall 5,3, depth 4, 10-bit: 15/16 of the coefficients). The bounds of
+`docs/FPGA.md` section 6, with the rounding included, keep every band of those levels and every sum inside their
+lifting steps below 32768, so they are transformed in 16-bit lanes and stored in 16 bits; the counter and the
+writer read them as such (the arithmetic after the load is unchanged), and the coarse levels stay 32-bit. Input
+samples beyond the bit depth are clamped, the only case the bounds do not cover. The same bytes out in 151 cases
+(three clips, 720p to UHD, odd sizes, 2-8 bpp, fixed q, with and without truncation) and on the constructed
+worst-case picture down to quantiser 0. `VC2_NO16=1` turns it off. 1080p 3 bpp, wavelet / whole encode:
+
+| | 32-bit | 16-bit |
+|---|---|---|
+| Pi 5, 1 thread | 13.3-14.2 / 50.6-51.6 ms | 8.2-8.8 / 44.2-44.8 ms |
+| Pi 5, 4 threads | 39.5 fps | **54.0-55.6 fps** |
+| Firefly, 1 thread | 11.6 / 51.3 ms | 8.6 / 46.4 ms |
+| Firefly, 4 threads | 55.8 fps | **65.3 fps** |
+| x86, 2 threads (CPU per frame) | 31.1-32.4 ms | 26.9-27.0 ms |
+
+So a Pi 5 now encodes 1080p50 at 3 bpp on its four cores, and the RK3588 has about 25 % headroom.
 
 ## 3. Decoder
 

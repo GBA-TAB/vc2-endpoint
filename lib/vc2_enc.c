@@ -13,16 +13,26 @@ static void vlc_init(void);
 #include "vc2_lift.h"
 #undef T
 #undef SUF
+#define T int16_t
+#define SUF _16
+#define T16
+#include "vc2_lift.h"
+#undef T16
+#undef T
+#undef SUF
 
 typedef struct {
     vc2_geom g;
     int32_t *img;                        // padded input, offset removed
     int32_t *band[VC2_MAX_DEPTH + 1][4];
     int32_t *ll[VC2_MAX_DEPTH + 1];
+    // 16-bit storage for the finest levels (l >= l16, see vc2_enc.l16): their bands, the input picture and the
+    // LL between two 16-bit levels; the last 16-bit level's LL goes to ll[] in 32 bits
+    int16_t *img16, *band16[VC2_MAX_DEPTH + 1][4], *ll16[VC2_MAX_DEPTH + 1];
     int *xs[VC2_MAX_DEPTH + 1], *ys[VC2_MAX_DEPTH + 1];
 } eplane;
 
-typedef struct { const int32_t *p; int level; float r16; } rowref; // one band row of a slice row
+typedef struct { const void *p; int level, is16; float r16; } rowref; // one band row of a slice row
 typedef struct { rowref *rows; uint32_t *bits, *dd; int32_t *tmp, *gather; uint8_t *obuf; } escratch;
 
 struct vc2_enc {
@@ -33,6 +43,9 @@ struct vc2_enc {
     uint8_t qm[VC2_MAX_DEPTH + 1][4];
     eplane pl[3];
     int nx, ny, nslices, max_rows;
+    // levels l >= l16 are transformed and stored in 16 bits: LeGall 5,3, depth 4, 10-bit, where the bounds are
+    // proven (every band and every sum inside a lifting step of the two finest levels below 32768); else depth + 1
+    int l16;
     float r16[VC2_NQ];
     escratch *scr;
     // rate control
@@ -88,12 +101,18 @@ vc2_enc *vc2_enc_new(const vc2_enc_cfg *c)
     if (e->nx < 1) e->nx = 1;
     if (e->ny < 1) e->ny = 1;
     e->nslices = e->nx * e->ny;
+    e->l16 = c->wavelet == VC2_WL_LEGALL5_3 && c->depth == 4 && c->bit_depth <= 10 && !getenv("VC2_NO16") ? c->depth - 1 : c->depth + 1;
     for (int i = 0; i < 3; i++) {
         eplane *p = &e->pl[i];
-        p->img = vc2_alloc((size_t)p->g.pw * p->g.ph * 4);
+        if (e->l16 <= c->depth) p->img16 = vc2_alloc((size_t)p->g.pw * p->g.ph * 2);
+        else p->img = vc2_alloc((size_t)p->g.pw * p->g.ph * 4);
         for (int l = 0; l <= c->depth; l++) {
-            for (int o = l ? 1 : 0; o < (l ? 4 : 1); o++) p->band[l][o] = vc2_alloc((size_t)p->g.bw[l] * p->g.bh[l] * 4);
+            for (int o = l ? 1 : 0; o < (l ? 4 : 1); o++) {
+                if (l >= e->l16 && o) p->band16[l][o] = vc2_alloc((size_t)p->g.bw[l] * p->g.bh[l] * 2);
+                else p->band[l][o] = vc2_alloc((size_t)p->g.bw[l] * p->g.bh[l] * 4);
+            }
             if (l && l < c->depth) p->ll[l] = vc2_alloc((size_t)16 * p->g.bw[l] * p->g.bh[l]);
+            if (l && l < c->depth && l >= e->l16 - 1) p->ll16[l] = vc2_alloc((size_t)8 * p->g.bw[l] * p->g.bh[l]);
             p->xs[l] = malloc((e->nx + 1) * sizeof(int));
             p->ys[l] = malloc((e->ny + 1) * sizeof(int));
             for (int k = 0; k <= e->nx; k++) p->xs[l][k] = (int)((int64_t)p->g.bw[l] * k / e->nx);
@@ -131,10 +150,10 @@ void vc2_enc_free(vc2_enc *e)
     vc2_pool_free(e->pool);
     for (int i = 0; i < 3; i++) {
         eplane *p = &e->pl[i];
-        free(p->img);
+        free(p->img); free(p->img16);
         for (int l = 0; l <= VC2_MAX_DEPTH; l++) {
-            for (int o = 0; o < 4; o++) free(p->band[l][o]);
-            free(p->ll[l]); free(p->xs[l]); free(p->ys[l]);
+            for (int o = 0; o < 4; o++) { free(p->band[l][o]); free(p->band16[l][o]); }
+            free(p->ll[l]); free(p->ll16[l]); free(p->xs[l]); free(p->ys[l]);
         }
     }
     for (int i = 0; i < th; i++) { free(e->scr[i].rows); free(e->scr[i].bits); free(e->scr[i].dd); free(e->scr[i].tmp); free(e->scr[i].gather); free(e->scr[i].obuf); }
@@ -208,6 +227,52 @@ static void analyse_level(const vc2_wavelet *wl, const int32_t *in, ptrdiff_t is
 #undef CLAMP
 }
 
+// The same in 16-bit lanes, for the levels whose bounds allow it (vc2_enc.l16)
+static void analyse_level16(const vc2_wavelet *wl, const int16_t *in, ptrdiff_t istride, int w, int h, int16_t *bands[4], int16_t *tmp)
+{
+    const int ns = wl->nsteps, sh = wl->shift, hw = (w + 2 * VC2_G + 7) & ~7;
+    int16_t *lo = tmp + VC2_G, *hi = tmp + hw + VC2_G;
+    int done[5] = { 0 }, rlo[5], rhi[5], tg[5];
+    for (int k = 1; k <= ns; k++) { const vc2_step *st = &wl->st[ns - k]; tg[k] = st->tgt; vc2_step_reach(st, &rlo[k], &rhi[k]); }
+#define CLAMP(i) ((i) < 0 ? 0 : (i) >= h ? h - 1 : (i))
+    for (int p = 0; p <= h; p++) {
+        if (p < h) {
+            for (int y = 2 * p; y < 2 * p + 2; y++) {
+                const int16_t *r = in + (size_t)y * istride;
+                for (int x = 0; x < w; x++) { lo[x] = (int16_t)(r[2 * x] << sh); hi[x] = (int16_t)(r[2 * x + 1] << sh); }
+                for (int j = ns - 1; j >= 0; j--) vc2_lift_h_16(lo, hi, w, &wl->st[j], -wl->st[j].sign);
+                memcpy(bands[(y & 1) * 2] + (size_t)(y / 2) * w, lo, w * 2);
+                memcpy(bands[(y & 1) * 2 + 1] + (size_t)(y / 2) * w, hi, w * 2);
+            }
+            done[0] = p + 1;
+        }
+        for (int k = 1; k <= ns; k++) {
+            const vc2_step *st = &wl->st[ns - k];
+            const int t = tg[k], off = t ? -1 : -2;
+            for (;;) {
+                int i = done[k];
+                if (i >= h) break;
+                // the other row type, as the previous step (or the horizontal pass) left it
+                int need = i + rhi[k] > h - 1 ? h - 1 : i + rhi[k];
+                if (done[k - 1] <= need) break;
+                // the previous step read this row type: all its rows that read row i must be done
+                if (k >= 2) {
+                    int last = i - rlo[k - 1];
+                    if ((last >= h - 1 || i == h - 1) ? done[k - 1] < h : done[k - 1] <= last) break;
+                }
+                for (int half = 0; half < 2; half++) {
+                    int16_t *tb = bands[t * 2 + half];
+                    const int16_t *ob = bands[!t * 2 + half];
+                    vc2_lift_16(tb + (size_t)i * w, tb + (size_t)i * w, ob + (size_t)CLAMP(i + off) * w, ob + (size_t)CLAMP(i + off + 1) * w,
+                                ob + (size_t)CLAMP(i + off + 2) * w, ob + (size_t)CLAMP(i + off + 3) * w, w, st, -st->sign);
+                }
+                done[k] = i + 1;
+            }
+        }
+    }
+#undef CLAMP
+}
+
 static void plane_job(void *arg, int job, int thread)
 {
     vc2_enc *e = arg;
@@ -215,14 +280,33 @@ static void plane_job(void *arg, int job, int thread)
     const int w = p->g.w, h = p->g.h, pw = p->g.pw, ph = p->g.ph, off = 1 << (e->c.bit_depth - 1), depth = e->c.depth;
     for (int y = 0; y < ph; y++) {
         const uint16_t *s = e->in[job] + (size_t)(y < h ? y : h - 1) * e->in_stride[job];
-        int32_t *d = p->img + (size_t)y * pw;
-        for (int x = 0; x < w; x++) d[x] = (int32_t)s[x] - off;
-        for (int x = w; x < pw; x++) d[x] = d[w - 1];
+        if (p->img16) {
+            int16_t *d = p->img16 + (size_t)y * pw;
+            // the 16-bit bounds hold for legal samples only: clamp what a file may carry beyond the bit depth
+            const int max = (1 << e->c.bit_depth) - 1;
+            for (int x = 0; x < w; x++) d[x] = (int16_t)((s[x] > max ? max : (int32_t)s[x]) - off);
+            for (int x = w; x < pw; x++) d[x] = d[w - 1];
+        } else {
+            int32_t *d = p->img + (size_t)y * pw;
+            for (int x = 0; x < w; x++) d[x] = (int32_t)s[x] - off;
+            for (int x = w; x < pw; x++) d[x] = d[w - 1];
+        }
     }
     for (int l = depth; l >= 1; l--) {
-        const int32_t *in = l == depth ? p->img : p->ll[l];
-        int32_t *bands[4] = { l == 1 ? p->band[0][0] : p->ll[l - 1], p->band[l][1], p->band[l][2], p->band[l][3] };
-        analyse_level(e->wl, in, 2 * p->g.bw[l], p->g.bw[l], p->g.bh[l], bands, e->scr[thread].tmp);
+        if (l >= e->l16) {
+            const int16_t *in = l == depth ? p->img16 : p->ll16[l];
+            // the last 16-bit level writes its LL into a 16-bit buffer first and widens it for the 32-bit levels
+            int16_t *bands[4] = { p->ll16[l - 1], p->band16[l][1], p->band16[l][2], p->band16[l][3] };
+            analyse_level16(e->wl, in, 2 * p->g.bw[l], p->g.bw[l], p->g.bh[l], bands, (int16_t *)e->scr[thread].tmp);
+            if (l == e->l16) {
+                int32_t *ll = l == 1 ? p->band[0][0] : p->ll[l - 1];
+                for (size_t i = 0, n = (size_t)p->g.bw[l] * p->g.bh[l]; i < n; i++) ll[i] = p->ll16[l - 1][i];
+            }
+        } else {
+            const int32_t *in = l == depth ? p->img : p->ll[l];
+            int32_t *bands[4] = { l == 1 ? p->band[0][0] : p->ll[l - 1], p->band[l][1], p->band[l][2], p->band[l][3] };
+            analyse_level(e->wl, in, 2 * p->g.bw[l], p->g.bw[l], p->g.bh[l], bands, e->scr[thread].tmp);
+        }
     }
 }
 
@@ -279,6 +363,57 @@ static int quant_row(const int32_t *c, int w, float r16, int32_t *v)
     }
 }
 
+// The same for rows stored in 16 bits (widened on load; the arithmetic is the same)
+// Bits, truncation cost (in 1/16 of a squared quantiser step) and "any nonzero" of one coefficient row.
+static inline __attribute__((always_inline)) void count_row_w16(const int16_t *c, int w, float r16, uint32_t *bits, uint32_t *dd, int *nz)
+{
+    uint32_t b = 0, d = 0, any = 0;
+    for (int x = 0; x < w; x++) {
+        int32_t n = (int32_t)(c[x] < 0 ? -c[x] : c[x]) << 2;
+        int32_t u16 = (int32_t)((float)n * r16), v = u16 >> 4;
+        uint32_t ex = (fbits((float)(v + 1)) >> 23) - 127;
+        int32_t vv = v > 255 ? 255 : v, uu = u16 > 4096 ? 4096 : u16;
+        b += 2 * ex + 1 + (v != 0);
+        d += v ? (uint32_t)((2 * vv + 1) * (uu - 8 * vv - 4)) : 0;
+        any |= (uint32_t)v;
+    }
+    *bits = b; *dd = d; *nz = any != 0;
+}
+
+// Slice rows are short; with the width known at compile time the loop becomes straight vector code.
+static void count_row16(const int16_t *c, int w, float r16, uint32_t *bits, uint32_t *dd, int *nz)
+{
+    switch (w) {
+    case 8: count_row_w16(c, 8, r16, bits, dd, nz); break;
+    case 16: count_row_w16(c, 16, r16, bits, dd, nz); break;
+    case 32: count_row_w16(c, 32, r16, bits, dd, nz); break;
+    case 64: count_row_w16(c, 64, r16, bits, dd, nz); break;
+    default: count_row_w16(c, w, r16, bits, dd, nz);
+    }
+}
+// quantised signed values of one row
+static inline __attribute__((always_inline)) int quant_row_w16(const int16_t *c, int w, float r16, int32_t *v)
+{
+    int32_t any = 0;
+    for (int x = 0; x < w; x++) {
+        int32_t a = c[x] < 0 ? -(int32_t)c[x] : c[x], q = (int32_t)((float)(a << 2) * r16) >> 4;
+        v[x] = c[x] < 0 ? -q : q;
+        any |= q;
+    }
+    return any != 0;
+}
+// returns 0 if the whole row quantises to zero
+static int quant_row16(const int16_t *c, int w, float r16, int32_t *v)
+{
+    switch (w) {
+    case 8: return quant_row_w16(c, 8, r16, v);
+    case 16: return quant_row_w16(c, 16, r16, v);
+    case 32: return quant_row_w16(c, 32, r16, v);
+    case 64: return quant_row_w16(c, 64, r16, v);
+    default: return quant_row_w16(c, w, r16, v);
+    }
+}
+
 // Sizes of the slices of one slice row at quantiser index qi: bytes per component, and the rows kept (coding
 // order). Works band row by band row, so the coefficient memory is read in order.
 static void count_slice_row(vc2_enc *e, escratch *s, int sy, int qi, uint16_t *bytes, uint16_t *cuts)
@@ -293,12 +428,19 @@ static void count_slice_row(vc2_enc *e, escratch *s, int sy, int qi, uint16_t *b
                 int q = qi - e->qm[l][o];
                 float r16 = e->r16[q < 0 ? 0 : q];
                 for (int y = p->ys[l][sy]; y < p->ys[l][sy + 1]; y++, n++) {
-                    const int32_t *row = p->band[l][o] + (size_t)y * p->g.bw[l];
                     const int *xs = p->xs[l];
                     int nz;
-                    s->rows[n] = (rowref){ row, l, r16 };
-                    for (int sx = 0; sx < nx; sx++)
-                        count_row(row + xs[sx], xs[sx + 1] - xs[sx], r16, &s->bits[n * nx + sx], &s->dd[n * nx + sx], &nz);
+                    if (p->band16[l][o]) {
+                        const int16_t *row = p->band16[l][o] + (size_t)y * p->g.bw[l];
+                        s->rows[n] = (rowref){ row, l, 1, r16 };
+                        for (int sx = 0; sx < nx; sx++)
+                            count_row16(row + xs[sx], xs[sx + 1] - xs[sx], r16, &s->bits[n * nx + sx], &s->dd[n * nx + sx], &nz);
+                    } else {
+                        const int32_t *row = p->band[l][o] + (size_t)y * p->g.bw[l];
+                        s->rows[n] = (rowref){ row, l, 0, r16 };
+                        for (int sx = 0; sx < nx; sx++)
+                            count_row(row + xs[sx], xs[sx + 1] - xs[sx], r16, &s->bits[n * nx + sx], &s->dd[n * nx + sx], &nz);
+                    }
                 }
             }
         for (int sx = 0; sx < nx; sx++) {
@@ -318,7 +460,7 @@ static void count_slice_row(vc2_enc *e, escratch *s, int sy, int qi, uint16_t *b
                 const rowref *r = &s->rows[best - 1];
                 int x0 = p->xs[r->level][sx], w = p->xs[r->level][sx + 1] - x0, x = w;
                 while (x > 0) {
-                    int32_t v = r->p[x0 + x - 1];
+                    int32_t v = r->is16 ? ((const int16_t *)r->p)[x0 + x - 1] : ((const int32_t *)r->p)[x0 + x - 1];
                     v = (int32_t)((float)((v < 0 ? -v : v) << 2) * r->r16) >> 4;
                     if (v) break;
                     x--;
@@ -448,14 +590,16 @@ static void write_job(void *arg, int sy, int thread)
         for (int l = 0; l <= depth; l++)
             for (int o = l ? 1 : 0; o < (l ? 4 : 1); o++)
                 for (int y = p->ys[l][sy]; y < p->ys[l][sy + 1]; y++, n++) {
-                    const int32_t *row = p->band[l][o] + (size_t)y * p->g.bw[l];
+                    const int32_t *row = p->band[l][o] ? p->band[l][o] + (size_t)y * p->g.bw[l] : 0;
+                    const int16_t *row16 = p->band16[l][o] ? p->band16[l][o] + (size_t)y * p->g.bw[l] : 0;
                     const int *xs = p->xs[l];
                     for (int sx = 0; sx < nx; sx++) {
                         int si = sy * nx + sx, q = e->sq[si] - e->qm[l][o];
                         if (n >= e->cut[e->sq[si]][si * 3 + c]) continue;
                         int32_t *gv = gc[c] + per_slice * sx + off;
                         // an all-zero row is marked in its spare last entry and written as a run of ones
-                        gv[xs[sx + 1] - xs[sx]] = quant_row(row + xs[sx], xs[sx + 1] - xs[sx], e->r16[q < 0 ? 0 : q], gv);
+                        int wd = xs[sx + 1] - xs[sx];
+                        gv[wd] = row16 ? quant_row16(row16 + xs[sx], wd, e->r16[q < 0 ? 0 : q], gv) : quant_row(row + xs[sx], wd, e->r16[q < 0 ? 0 : q], gv);
                     }
                     off += (p->g.bw[l] + nx - 1) / nx + 1;
                 }

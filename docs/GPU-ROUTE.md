@@ -54,7 +54,9 @@ that.
    4,4,1; 6,6,4} against the default {4; 2,2,0; 4,4,2; 5,5,3; 7,7,5}) gives -0.01 to -0.08 dB Y and +-0.02 dB on
    the average over two natural clips (1080p, UHD) at 1.5-4 bpp; coarser finest-level variants lose up to 0.7 dB.
    The default stays.
-2. **CPU, 16-bit storage for the finest levels.** The proven bounds (FPGA.md section 6): the finest level's
+2. **CPU, 16-bit storage for the finest levels.** Done 2026-11-23 (README section 2): Pi 5 1080p50 on four
+   cores (39.5 -> 55 fps), Firefly 55.8 -> 65.3 fps, byte-identical. The counting still widens to 32 bits after
+   the load; 16-bit counting lanes are the next step there. The proven bounds (FPGA.md section 6): the finest level's
    bands fit 13 bits, the next 15-16; only the two coarsest need 17. Storing levels 3-4 (three quarters of the
    samples) in 16 bits halves the wavelet's and the counter's memory traffic and doubles the NEON lanes.
 3. **Mali, the encoder's front end (OpenCL, libmali).** Forward wavelet and per-slice counting on the GPU:
