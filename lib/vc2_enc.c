@@ -644,6 +644,13 @@ static int quant_row16(const int16_t *c, int w, float r16, int32_t *v)
 // and uu = min(16 v + f, 4096): for v <= 255 that is (2v + 1)(8v + f - 4), above it the constant 511 * 2052.
 #ifdef __aarch64__
 #include <arm_neon.h>
+// the largest magnitude of a segment (w a multiple of 8): v = floor(4|c| / qf) is 0 for all of it iff 4 max < qf
+static inline uint32_t seg_max16(const int16_t *c, int w)
+{
+    uint16x8_t mx = vreinterpretq_u16_s16(vabsq_s16(vld1q_s16(c)));
+    for (int x = 8; x < w; x += 8) mx = vmaxq_u16(mx, vreinterpretq_u16_s16(vabsq_s16(vld1q_s16(c + x))));
+    return vmaxvq_u16(mx);
+}
 static inline uint16x8_t mulhi16(uint16x8_t a, uint16x8_t b)
 {
     return vuzp2q_u16(vreinterpretq_u16_u32(vmull_u16(vget_low_u16(a), vget_low_u16(b))), vreinterpretq_u16_u32(vmull_high_u16(a, b)));
@@ -653,6 +660,7 @@ static inline __attribute__((always_inline)) void count_row16v(const int16_t *c,
 {
     if (t->mode == 2) { *bits = (uint32_t)w; *dd = 0; *nz = 0; return; }
 #ifdef __aarch64__
+    if (t->mode == 1 && w >= 8 && !(w & 7) && seg_max16(c, w) * 4 < t->qf) { *bits = (uint32_t)w; *dd = 0; *nz = 0; return; } // all 0
     if (t->mode == 1 && w >= 8) {
         const uint16x8_t m = vdupq_n_u16(t->m), m2 = vdupq_n_u16(t->m2), qf = vdupq_n_u16(t->qf), lim = vdupq_n_u16(255);
         const int16x8_t sh = vdupq_n_s16(-(int16_t)(t->s - t->av)), sh2 = vdupq_n_s16(-(int16_t)(t->s2 - t->af)), k = vdupq_n_s16((int16_t)t->k);
@@ -693,6 +701,7 @@ static inline int quant_row16v(const int16_t *c, int w, const cnt16 *t, float r1
 {
     if (t->mode == 2) return 0; // every value 0: the writer then reads only the flag
 #ifdef __aarch64__
+    if (t->mode == 1 && w >= 8 && !(w & 7) && seg_max16(c, w) * 4 < t->qf) return 0; // all 0: the values are not read
     if (t->mode == 1 && w >= 8 && !(w & 7)) {
         const uint16x8_t m = vdupq_n_u16(t->m);
         const int16x8_t sh = vdupq_n_s16(-(int16_t)(t->s - t->av));

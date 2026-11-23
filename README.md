@@ -190,6 +190,14 @@ bands. The same bytes with 1 to 7 strips per plane (99 cases); `VC2_WV_STRIPS=n`
 order. Firefly four threads 68.3 -> 74.3 fps (wavelet 4.7 -> 3.5 ms); Pi 5 54.5 -> 56 fps (its wavelet is
 bound by memory bandwidth).
 
+**All-zero segments.** At 2-3 bpp a third of the coefficients of the 16-bit bands lie in slice segments that are
+all 0 at the evaluated quantiser (24 % at 5 bpp). v = floor(4|c| / qf) is 0 for all of a segment exactly when
+4 max |c| < qf, so the NEON counter and quantiser test the segment's maximum first and skip the arithmetic for
+such a segment (one bit per value, no truncation cost; the writer reads only the flag). The same bytes as before
+(165 cases on the Pi 5, 167 on the Firefly, the GPU path included). Counting per 1080p frame on one core: Firefly
+21.1 -> 16.1 ms, Pi 5 21.7 -> 18.2 ms; four threads: **Firefly 74 -> 82.5 fps, Pi 5 56.4 -> 59.4 fps**. On x86
+the same test in the float counter costs more than it saves, so it is ARM only.
+
 **The front end on Mali (`make GPU=cl`, `vc2enc --gpu cl`).** The two 16-bit levels as an OpenCL kernel
 (`lib/vc2_fwd.cl`, `lib/vc2_enc_cl.c`): one work-item per 8 band columns and 16 band rows, horizontal lifting
 per row, the vertical steps in a rolling window, one row pair recomputed above each strip. Bit-exact: all 5.2
