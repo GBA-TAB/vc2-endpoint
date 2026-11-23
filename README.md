@@ -1,5 +1,14 @@
 # vc2-endpoint: VC-2 (SMPTE ST 2042, HQ profile) encoder, decoder, RTP and player
 
+> **This is the branch `fork/rc-bracketed`, a fork of `main`. It is not mainline.**
+> Its rate control picks the frame quantiser with a bracketed search instead of `main`'s one-index steps, so
+> **its encoder output is not byte-identical with `main`** where the two searches end on different
+> quantisers (on our test sequence: never coarser than `main`, finer in 10-40 % of the frames). Streams stay
+> standard VC-2; the decoder, RTP and player are the same as on `main`. `VC2_RC_STEP=1` runs `main`'s search
+> for comparison (byte-identical with `main`). Why, how, and the measurements:
+> [docs/RATE-CONTROL-FORK.md](docs/RATE-CONTROL-FORK.md). Everything below this box is `main`'s README as of
+> 122f0cc; its encoder figures were measured on `main`.
+
 VC-2 is the royalty-free intra-frame wavelet codec from the BBC (Dirac Pro). This repo has an encoder, a
 low-latency decoder (CPU, with an optional GPU stage through OpenCL or Vulkan), the RTP payload of RFC 8450,
 and a DRM player for embedded boards. It was written as an alternative to JPEG XS for low-latency video

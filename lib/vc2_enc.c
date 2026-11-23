@@ -4,6 +4,7 @@
 #include "vc2_priv.h"
 #include "vc2_enc_gpu.h"
 #include <stdio.h>
+#include <math.h>
 #ifdef __aarch64__
 #include <arm_neon.h>
 #endif
@@ -78,6 +79,7 @@ struct vc2_enc {
     uint8_t *sq;                // chosen quantiser per slice
     size_t *soff;               // slice offsets in the output
     int last_q, scaler;
+    double rc_slope; // log2 of the size drop per quantiser index, measured by the last search (0: none yet)
     uint32_t prev_unit;         // size of the last data unit written (parse info chain)
     long q_sum;
     // per-call
@@ -930,6 +932,73 @@ static int fits(vc2_enc *e, int q, int r0, int r1, size_t budget, int *sc, size_
     return *tot <= budget;
 }
 
+// The lowest quantiser that fits the unit's budget, by a bracketed search on log2(size / budget). The start
+// index (the last frame's) is counted first and kept when it fits with more than 18 % of the budget to spare (the
+// steady state: one count). Otherwise the bracket (lo: largest index known not to fit, hi: smallest known to fit)
+// starts from every index already counted for these rows in this frame (free), and the next index comes from the
+// secant between the bracket's ends (Illinois: the end that has stayed twice counts half, so the secant gets past
+// the size floor of very coarse indices), or, with one end only, from the slope of the last two points on that
+// side (the last search's slope with one point), the step capped at twice the previous one (8 at first).
+// Ends when hi = lo + 1: hi is the answer. Assumes the size falls with the index, as the step search did.
+static int counted(vc2_enc *e, int q, int r0, int r1)
+{
+    if (!e->valid[q]) return 0;
+    for (int r = r0; r < r1; r++) if (e->valid[q][r] != e->frame + 1) return 0;
+    return 1;
+}
+static int rc_search(vc2_enc *e, int q, int r0, int r1, size_t budget, int *sc, size_t *tot)
+{
+    int lo = -1, hi = VC2_NQ, s, side = 0, same = 0, p2 = -1, last_step = 0;
+    double llo = 0, lhi = 0, l2 = 0, k = e->rc_slope > 0 ? e->rc_slope : 0.15;
+    size_t t;
+    int f = fits(e, q, r0, r1, budget, &s, &t);
+    double l = log2((t ? t : 1) / (double)budget);
+    if (f && t * 100 > budget * 82) { *sc = s; *tot = t; return q; }
+    for (int g = 0; g < VC2_NQ; g++) {
+        if (g != q && !counted(e, g, r0, r1)) continue;
+        int gf = fits(e, g, r0, r1, budget, &s, &t);
+        double gl = log2((t ? t : 1) / (double)budget);
+        if (gf && g < hi) { hi = g; lhi = gl; }
+        if (!gf && g > lo && g < hi) { lo = g; llo = gl; }
+    }
+    if (lo >= hi) lo = -1;
+    while (hi - lo > 1) {
+        int g;
+        if (lo >= 0 && hi < VC2_NQ) {
+            double a = llo, b = lhi;
+            if (same >= 2 && side < 0) b *= 0.5;
+            if (same >= 2 && side > 0) a *= 0.5;
+            g = (int)ceil(lo + a / (a - b) * (hi - lo) - 1e-9);
+        } else {
+            int e1 = lo < 0 ? hi : lo, cap = last_step > 4 ? 2 * last_step : 8;
+            double le = lo < 0 ? lhi : llo, ks = k;
+            if (p2 >= 0 && p2 != e1) { ks = (l2 - le) / (e1 - p2); if (ks < 0.02) ks = 0.02; }
+            int st = lo < 0 ? (int)floor(-le / ks + 1e-9) : (int)ceil(le / ks - 1e-9);
+            if (st > cap) st = cap;
+            g = lo < 0 ? hi - st : lo + st;
+        }
+        if (g <= lo) g = lo + 1;
+        if (g >= hi) g = hi - 1;
+        if (g < 0) g = 0;
+        if (g > VC2_NQ - 1) g = VC2_NQ - 1;
+        last_step = abs(g - (lo < 0 ? hi : lo));
+        f = fits(e, g, r0, r1, budget, &s, &t);
+        l = log2((t ? t : 1) / (double)budget);
+        int nside = f ? 1 : -1;
+        same = nside == side ? same + 1 : 1;
+        side = nside;
+        if (f) { if (lo < 0) { p2 = hi; l2 = lhi; } hi = g; lhi = l; }
+        else { if (hi >= VC2_NQ) { p2 = lo; l2 = llo; } lo = g; llo = l; }
+    }
+    if (lo >= 0 && hi < VC2_NQ && llo > lhi) {
+        double ks = (llo - lhi) / (hi - lo);
+        e->rc_slope = ks < 0.02 ? 0.02 : ks > 2 ? 2 : ks;
+    }
+    if (hi >= VC2_NQ) hi = VC2_NQ - 1;
+    fits(e, hi, r0, r1, budget, sc, tot);
+    return hi;
+}
+
 static int gcd(int a, int b) { while (b) { int t = a % b; a = b; b = t; } return a; }
 
 // --- slice writer -------------------------------------------------------------------------------------------
@@ -1096,6 +1165,7 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
     const int unit = e->c.rc_rows > 0 && e->c.rc_rows < e->ny ? e->c.rc_rows : e->ny;
     const double frame_budget = e->c.width * (double)e->c.height * e->c.bpp / 8 - 64;
     uint8_t uq[4096];
+    const int rc_step = getenv("VC2_RC_STEP") != 0;
     // quantiser per unit; the size scaler is common to the picture, so repeat if a unit needs a larger one
     for (e->scaler = 1;;) {
         int sc_need = e->scaler, q = e->last_q;
@@ -1104,10 +1174,12 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
             size_t budget = (size_t)(frame_budget * (r1 - r0) / e->ny), tot = 0;
             if (e->c.fixed_q > 0) { q = e->c.fixed_q; fits(e, q, r0, r1, 0, &sc, &tot); }
             else {
-                while (!fits(e, q, r0, r1, budget, &sc, &tot) && q < VC2_NQ - 1) q++;
-                // one index lower is worth a full count only when a good part of the budget is left
-                while (q > 0 && tot * 100 <= budget * 82 && fits(e, q - 1, r0, r1, budget, &sc, &tot)) q--;
-                fits(e, q, r0, r1, budget, &sc, &tot);
+                if (!rc_step) q = rc_search(e, q, r0, r1, budget, &sc, &tot);
+                else { // main's step search (VC2_RC_STEP=1), for comparison
+                    while (!fits(e, q, r0, r1, budget, &sc, &tot) && q < VC2_NQ - 1) q++;
+                    while (q > 0 && tot * 100 <= budget * 82 && fits(e, q - 1, r0, r1, budget, &sc, &tot)) q--;
+                    fits(e, q, r0, r1, budget, &sc, &tot);
+                }
             }
             if (sc > sc_need) sc_need = sc;
             uq[u] = q;
@@ -1138,6 +1210,13 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
                     if (tot - a + b <= budget && lo[0] <= lim && lo[1] <= lim && lo[2] <= lim) { tot = tot - a + b; e->sq[si] = q - 1; }
                 }
             done += batch;
+        }
+        // drift: when the refinement took every slice of the first unit one index lower, the next frame starts
+        // there (on a flat size curve the 82 % rule would otherwise keep the quantiser one index too coarse)
+        if (!rc_step && u == 0 && q > 0 && e->c.fixed_q <= 0) {
+            int all = 1;
+            for (int i = 0; i < n * e->nx && all; i++) all = e->sq[r0 * e->nx + i] == q - 1;
+            if (all) e->last_q = q - 1;
         }
     }
     // a slice larger than the cap gets a coarser quantiser until it fits
