@@ -22,15 +22,25 @@ So every step below is judged by bytes moved per frame first, then by launches, 
 The RK3588 boards are the endpoints. libmali (the vendor's OpenCL, Valhall g13p0 here) is the driver that works
 today on the vendor kernels, and it carries the decoder's UHD path.
 
-### Where the encoder stands (1080p 3 bpp, LeGall 5,3, after the line-by-line wavelet)
+### Where the encoder stands (1080p 3 bpp, LeGall 5,3)
+
+At the start of 2026-11-22 (after the line-by-line wavelet), one thread:
 
 | | wavelet | rate control (counting) | writing | fps, 4 threads |
 |---|---:|---:|---:|---:|
 | Pi 5, 1 thread | 12.5 ms | 23.8 ms | 11.8 ms | 39.7 |
 | RK3588 A76 at 2.0 GHz, 1 thread | 11.4 ms | 23.4 ms | 13.9 ms | 54.3 |
 
-The RK3588 encodes 1080p50 on its four A76 cores, with nothing left for anything else. UHD50 needs four times
-that.
+On the morning of 2026-11-23, after the steps below, the same bytes out:
+
+| | wavelet | counting | writing | 1 thread | 2 threads | 4 threads |
+|---|---:|---:|---:|---:|---:|---:|
+| Pi 5 | 6.9 ms | 15.8 ms | 8.8 ms | 29.8 fps | 53.5 fps | 71.7 fps |
+| RK3588 (Firefly), CPU | 7.6 ms | 13.8 ms | 10.5 ms | 28.7 fps | 54.4 fps | 92-96 fps |
+| RK3588 + Mali front end | - | - | - | 34 fps | 56 fps | 72 fps |
+
+Both boards encode 1080p50 on two cores; live (encode at each frame's slot and send) on four (README section 7).
+UHD on the RK3588: 18.7 fps on four cores, with or without the Mali (half the CPU with it).
 
 ### Steps, in order
 
