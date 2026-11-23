@@ -148,7 +148,9 @@ vertical step runs on the band rows whose inputs are final, while they are still
 same bytes out (checked against the previous encoder for all six wavelets, depths 1-5, 1 and 3 threads, sizes
 64x34 to 3840x2160). Pi 5: wavelet 18.7 -> 12.5 ms, 4 threads 29.6 -> 39.7 fps; Firefly: 7.6 -> 6.6 ms, 51.2 ->
 54.3 fps, so the RK3588 encodes 1080p50 at 3 bpp on its four A76 cores. Single thread, the rate control's
-counting (24 ms) and the writer (12-14 ms) are now most of the time.
+counting (24 ms) and the writer (12-14 ms) are now most of the time. The writer collects short codes in a local
+word and stores them a few at a time, with one table lookup for two small values (|v| <= 7): 12.0 -> 9.9 ms on a
+Pi 5 core, 14.1 -> 12.0 ms on the Firefly, 8.5 -> 7.7 ms on x86, the same bytes out (99 cases).
 
 ## 3. Decoder
 

@@ -405,6 +405,10 @@ static inline uint32_t spread16(uint32_t x)
 #define VLC_R 64
 static uint16_t vlc_code[2 * VLC_R];
 static uint8_t vlc_len[2 * VLC_R];
+// two values at once, |v| <= 7 each: the two codes back to back (at most 8 + 8 bits)
+#define VLC_P 7
+static uint16_t vlc2_code[(2 * VLC_P + 1) * (2 * VLC_P + 1)];
+static uint8_t vlc2_len[(2 * VLC_P + 1) * (2 * VLC_P + 1)];
 static void vlc_init(void)
 {
     for (int i = 0; i < 2 * VLC_R; i++) {
@@ -414,6 +418,12 @@ static void vlc_init(void)
         vlc_code[i] = sv ? spread16(v - (1u << k)) << 2 | 2 | (sv < 0) : 1;
         vlc_len[i] = sv ? 2 * k + 2 : 1;
     }
+    for (int a = -VLC_P; a <= VLC_P; a++)
+        for (int b = -VLC_P; b <= VLC_P; b++) {
+            int i = (a + VLC_P) * (2 * VLC_P + 1) + b + VLC_P, ia = a + VLC_R, ib = b + VLC_R;
+            vlc2_code[i] = (uint16_t)(vlc_code[ia] << vlc_len[ib] | vlc_code[ib]);
+            vlc2_len[i] = vlc_len[ia] + vlc_len[ib];
+        }
 }
 
 // One slice row: quantise band row by band row into per-slice buffers in coding order, then write the slices.
@@ -468,14 +478,33 @@ static void write_job(void *arg, int sy, int thread)
                         for (int x = w; x > 0; x -= 32) put(&b, x >= 32 ? 0xffffffffu : (1u << x) - 1, x >= 32 ? 32 : x);
                         continue;
                     }
+                    // short codes are collected in a local word (at most 16 bits per step, stored once it holds over 40)
+                    uint64_t la = 0;
+                    int ln = 0;
                     for (int x = 0; x < w; x++) {
+                        uint32_t pa = (uint32_t)(vq[x] + VLC_P), pb = (uint32_t)(vq[x + 1] + VLC_P);
+                        if (x + 1 < w && pa <= 2 * VLC_P && pb <= 2 * VLC_P) { // the common case: two small values
+                            int j = pa * (2 * VLC_P + 1) + pb;
+                            la = la << vlc2_len[j] | vlc2_code[j];
+                            ln += vlc2_len[j];
+                            if (ln > 40) { put(&b, la, ln); la = 0; ln = 0; }
+                            x++;
+                            continue;
+                        }
                         uint32_t i = (uint32_t)(vq[x] + VLC_R);
-                        if (__builtin_expect(i < 2 * VLC_R, 1)) { put(&b, vlc_code[i], vlc_len[i]); continue; }
+                        if (__builtin_expect(i < 2 * VLC_R, 1)) {
+                            la = la << vlc_len[i] | vlc_code[i];
+                            ln += vlc_len[i];
+                            if (ln > 40) { put(&b, la, ln); la = 0; ln = 0; }
+                            continue;
+                        }
+                        if (ln) { put(&b, la, ln); la = 0; ln = 0; }
                         uint32_t v = (uint32_t)(vq[x] < 0 ? -vq[x] : vq[x]) + 1;
                         int kk = 31 - __builtin_clz(v);
                         for (int j = kk - 1; j >= 0; j--) put(&b, (v >> j) & 1, 2);
                         put(&b, 2 | (vq[x] < 0), 2);
                     }
+                    if (ln) put(&b, la, ln);
                 }
             }
             // the rest of the counted size, and the padding, are ones (zeros for the decoder)
