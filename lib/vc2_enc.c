@@ -2,6 +2,7 @@
 // frame by default) plus per-slice refinement, tail truncation, slice writer.
 #define _GNU_SOURCE
 #include "vc2_priv.h"
+#include "vc2_enc_gpu.h"
 #include <stdio.h>
 #include <time.h>
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
@@ -29,6 +30,7 @@ typedef struct {
     // 16-bit storage for the finest levels (l >= l16, see vc2_enc.l16): their bands, the input picture and the
     // LL between two 16-bit levels; the last 16-bit level's LL goes to ll[] in 32 bits
     int16_t *img16, *band16[VC2_MAX_DEPTH + 1][4], *ll16[VC2_MAX_DEPTH + 1];
+    int16_t *own16[VC2_MAX_DEPTH + 1][4]; // band16 as allocated (with the GPU front end band16 points into its maps)
     int *xs[VC2_MAX_DEPTH + 1], *ys[VC2_MAX_DEPTH + 1];
 } eplane;
 
@@ -53,6 +55,8 @@ struct vc2_enc {
     // levels l >= l16 are transformed and stored in 16 bits: LeGall 5,3, depth 4, 10-bit, where the bounds are
     // proven (every band and every sum inside a lifting step of the two finest levels below 32768); else depth + 1
     int l16;
+    vc2_encgpu *gpu;            // the GPU front end, when set (vc2_enc_set_gpu)
+    double gpu_ms;
     float r16[VC2_NQ];
     cnt16 c16[VC2_NQ];
     escratch *scr;
@@ -148,7 +152,7 @@ vc2_enc *vc2_enc_new(const vc2_enc_cfg *c)
         else p->img = vc2_alloc((size_t)p->g.pw * p->g.ph * 4);
         for (int l = 0; l <= c->depth; l++) {
             for (int o = l ? 1 : 0; o < (l ? 4 : 1); o++) {
-                if (l >= e->l16 && o) p->band16[l][o] = vc2_alloc((size_t)p->g.bw[l] * p->g.bh[l] * 2);
+                if (l >= e->l16 && o) p->band16[l][o] = p->own16[l][o] = vc2_alloc((size_t)p->g.bw[l] * p->g.bh[l] * 2);
                 else p->band[l][o] = vc2_alloc((size_t)p->g.bw[l] * p->g.bh[l] * 4);
             }
             if (l && l < c->depth) p->ll[l] = vc2_alloc((size_t)16 * p->g.bw[l] * p->g.bh[l]);
@@ -190,11 +194,12 @@ void vc2_enc_free(vc2_enc *e)
     if (!e) return;
     int th = vc2_pool_threads(e->pool);
     vc2_pool_free(e->pool);
+    vc2_encgpu_free(e->gpu);
     for (int i = 0; i < 3; i++) {
         eplane *p = &e->pl[i];
         free(p->img); free(p->img16);
         for (int l = 0; l <= VC2_MAX_DEPTH; l++) {
-            for (int o = 0; o < 4; o++) { free(p->band[l][o]); free(p->band16[l][o]); }
+            for (int o = 0; o < 4; o++) { free(p->band[l][o]); free(p->own16[l][o]); }
             free(p->ll[l]); free(p->ll16[l]); free(p->xs[l]); free(p->ys[l]);
         }
     }
@@ -203,6 +208,19 @@ void vc2_enc_free(vc2_enc *e)
     free(e->scr); free(e->sq); free(e->soff);
     free(e);
 }
+
+int vc2_enc_set_gpu(vc2_enc *e, int backend)
+{
+    vc2_encgpu_free(e->gpu);
+    e->gpu = 0;
+    if (backend == VC2_GPU_OFF) return 0;
+    if (backend != VC2_GPU_OPENCL || e->l16 != 3 || e->c.depth != 4) return -1; // the kernel is LeGall 5,3, 16-bit
+    int pw[3] = { e->pl[0].g.pw, e->pl[1].g.pw, e->pl[2].g.pw };
+    if (e->pl[1].g.ph != e->pl[0].g.ph) return -1; // 4:2:2 / 4:4:4 only
+    e->gpu = vc2_encgpu_new(pw, e->pl[0].g.ph);
+    return e->gpu ? 0 : -1;
+}
+double vc2_enc_gpu_ms(const vc2_enc *e) { return e->gpu ? e->gpu_ms : -1; }
 
 size_t vc2_enc_max_size(const vc2_enc *e)
 {
@@ -313,6 +331,46 @@ static void analyse_level16(const vc2_wavelet *wl, const int16_t *in, ptrdiff_t 
         }
     }
 #undef CLAMP
+}
+
+// the GPU front end: the input planes into its buffer, then (after the launch) the coarse levels on the CPU
+static void gpu_in_job(void *arg, int job, int thread)
+{
+    (void)thread;
+    vc2_enc *e = arg;
+    eplane *p = &e->pl[job];
+    const int w = p->g.w, h = p->g.h, pw = p->g.pw, ph = p->g.ph, off = 1 << (e->c.bit_depth - 1), max = (1 << e->c.bit_depth) - 1;
+    int16_t *dst = vc2_encgpu_input(e->gpu, job);
+    for (int y = 0; y < ph; y++) {
+        const uint16_t *s = e->in[job] + (size_t)(y < h ? y : h - 1) * e->in_stride[job];
+        int16_t *d = dst + (size_t)y * pw;
+        for (int x = 0; x < w; x++) d[x] = (int16_t)((s[x] > max ? max : (int32_t)s[x]) - off);
+        for (int x = w; x < pw; x++) d[x] = d[w - 1];
+    }
+}
+static void gpu_coarse_job(void *arg, int job, int thread)
+{
+    vc2_enc *e = arg;
+    eplane *p = &e->pl[job];
+    for (int l = e->l16 - 1; l >= 1; l--) {
+        const int32_t *in = p->ll[l];
+        int32_t *bands[4] = { l == 1 ? p->band[0][0] : p->ll[l - 1], p->band[l][1], p->band[l][2], p->band[l][3] };
+        analyse_level(e->wl, in, 2 * p->g.bw[l], p->g.bw[l], p->g.bh[l], bands, e->scr[thread].tmp);
+    }
+}
+static int gpu_wavelet(vc2_enc *e)
+{
+    for (int c = 0; c < 3; c++) if (!vc2_encgpu_input(e->gpu, c)) return -1;
+    vc2_pool_run(e->pool, gpu_in_job, e, 3);
+    int16_t *b4[3][4], *b3[3][4];
+    if (vc2_encgpu_run(e->gpu, b4, b3, &e->gpu_ms)) return -1;
+    for (int c = 0; c < 3; c++) {
+        eplane *p = &e->pl[c];
+        for (int o = 1; o < 4; o++) { p->band16[4][o] = b4[c][o]; p->band16[3][o] = b3[c][o]; }
+        for (size_t i = 0, n = (size_t)p->g.bw[3] * p->g.bh[3]; i < n; i++) p->ll[2][i] = b3[c][0][i];
+    }
+    vc2_pool_run(e->pool, gpu_coarse_job, e, 3);
+    return 0;
 }
 
 static void plane_job(void *arg, int job, int thread)
@@ -755,7 +813,13 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
 {
     double t0 = now(); n_eval = 0;
     e->in = plane; e->in_stride = stride;
-    vc2_pool_run(e->pool, plane_job, e, 3);
+    if (e->gpu && gpu_wavelet(e)) {
+        fprintf(stderr, "vc2: the GPU front end failed, on the CPU from now on\n");
+        vc2_encgpu_free(e->gpu);
+        e->gpu = 0;
+        for (int c = 0; c < 3; c++) for (int l = 0; l <= VC2_MAX_DEPTH; l++) for (int o = 0; o < 4; o++) e->pl[c].band16[l][o] = e->pl[c].own16[l][o];
+    }
+    if (!e->gpu) vc2_pool_run(e->pool, plane_job, e, 3);
     double t1 = now();
 
     const int unit = e->c.rc_rows > 0 && e->c.rc_rows < e->ny ? e->c.rc_rows : e->ny;

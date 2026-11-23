@@ -36,6 +36,7 @@ board; that work is not part of this repo, and no JPEG XS code is.
 | `player/vc2play.c` | DRM player (NV20 on the CRTC's primary plane, vblank pacing), `play.sh` |
 | `scripts/verify.sh` | bit-exactness against ffmpeg's decoder |
 | `docs/RTP.md` | the RTP mapping and what is open |
+| `lib/vc2_enc_cl.c`, `vc2_fwd.cl`, `vc2_enc_gpu.h` | the encoder's GPU front end (OpenCL, Mali): the two finest forward levels, bit-exact |
 | `docs/GPU-ROUTE.md` | the GPU plan: encoder steps on the RK3588 boards (libmali), then CUDA for streams per GPU (memory, entropy, PCIe limits) |
 | `docs/FPGA.md` | a hardware (FPGA) decoder: the subset, the exact arithmetic, the reference vectors (`scripts/fpga-vectors.sh`) |
 
@@ -179,6 +180,18 @@ and 54) keep the generic counter, and for the 61 coarsest every value of such a 
 operation count promised, because the A76 has one vector multiply pipe and each coefficient needs seven:
 counting 23.8 -> 21.7 ms (Pi 5) and 23.5 -> 21.2 ms (Firefly) per frame on one core; four threads: Pi 5
 51-54 -> 56 fps, Firefly 63-64 -> 66.7 fps. `VC2_NO16C=1` turns it off.
+
+**The front end on Mali (`make GPU=cl`, `vc2enc --gpu cl`).** The two 16-bit levels as an OpenCL kernel
+(`lib/vc2_fwd.cl`, `lib/vc2_enc_cl.c`): one work-item per 8 band columns and 16 band rows, horizontal lifting
+per row, the vertical steps in a rolling window, one row pair recomputed above each strip. Bit-exact: all 5.2
+million coefficients of both levels per 1080p frame equal a plain C reference, and the encoder's output equals
+the CPU path in 81 cases (720p, 1080p, UHD, 1.5-8 bpp, fixed q, the worst-case picture). On the Firefly's
+Mali-G610 (libmali g13p0) both levels for the three components take 1.4-1.9 ms of GPU time per 1080p frame;
+one A76 core needs about 8 ms for them. The CPU writes the input into the driver's buffer (1 ms) and reads the
+bands in place (0.8 ms more than from its own memory); the coarse levels, the counting and the writer stay on the
+CPU. Per 1080p frame at 3 bpp: CPU 47.3 -> 41.9 ms (four threads), one thread 44.8 -> 41.8 ms wall; with several
+threads the frame rate stays the same (66-67 fps), since the CPU waits for the GPU. Component widths must be
+multiples of 64.
 
 ## 3. Decoder
 

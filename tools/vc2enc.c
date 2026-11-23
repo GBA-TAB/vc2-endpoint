@@ -13,6 +13,7 @@ int main(int argc, char **argv)
 {
     int w = 1920, h = 1080, loops = 1, quiet = 0;
     const char *in = 0, *out = 0;
+    int gpu = 0;
     vc2_enc_cfg c;
     vc2_enc_defaults(&c, w, h);
     for (int i = 1; i < argc; i++) {
@@ -38,13 +39,14 @@ int main(int argc, char **argv)
                 for (int o = l ? 1 : 0; o < (l ? 4 : 1) && t; o++, t = strtok(0, ",")) c.qm[l][o] = atoi(t);
             i++;
         }
+        else if (!strcmp(a, "--gpu")) { gpu = !strcmp(v, "cl") ? VC2_GPU_OPENCL : -1; i++; }
         else if (!strcmp(a, "-q")) quiet = 1;
         else if (!in) in = a;
         else if (!out) out = a;
     }
     if (!in || !out) {
         fprintf(stderr, "usage: vc2enc [-s WxH] [--bpp 3] [--wavelet 1] [--depth 4] [--slice 128x16] [--rc-rows 0] [--tail 0.2]\n"
-                        "              [--fps 50] [--threads 1] [--chroma 1] [--loops 1] [--qm list] [--q N] [--no-truncate] [--max-slice bytes] in.yuv out.vc2\n"
+                        "              [--fps 50] [--threads 1] [--chroma 1] [--loops 1] [--qm list] [--q N] [--no-truncate] [--max-slice bytes] [--gpu cl] in.yuv out.vc2\n"
                         "  wavelets: 0 DD 9,7  1 LeGall 5,3  2 DD 13,7  3 Haar  4 Haar (shift)  6 Daubechies 9,7\n");
         return 2;
     }
@@ -55,13 +57,14 @@ int main(int argc, char **argv)
     if (!fi || !fo) { perror("open"); return 1; }
     vc2_enc *e = vc2_enc_new(&c);
     if (!e) { fprintf(stderr, "bad settings\n"); return 1; }
+    if (gpu && vc2_enc_set_gpu(e, gpu < 0 ? 99 : gpu)) { fprintf(stderr, "--gpu: not available for these settings or this build (make GPU=cl)\n"); return 1; }
     uint16_t *frame = malloc(fsz);
     uint8_t *buf = malloc(vc2_enc_max_size(e));
     const uint16_t *pl[3] = { frame, frame + (size_t)w * h, frame + (size_t)w * h + (size_t)cw * ch };
     ptrdiff_t st[3] = { w, cw, cw };
     int frames = 0;
     size_t bytes = 0;
-    double t_enc = 0, c_enc = 0, qs = 0;
+    double t_enc = 0, c_enc = 0, qs = 0, g_ms = 0;
     for (int l = 0; l < loops; l++) {
         rewind(fi);
         while (fread(frame, 1, fsz, fi) == fsz) {
@@ -69,6 +72,7 @@ int main(int argc, char **argv)
             size_t n = vc2_enc_encode(e, pl, st, buf);
             t_enc += now() - t0; c_enc += cpu() - c0;
             qs += vc2_enc_last_q(e) / 100.0;
+            if (gpu) g_ms += vc2_enc_gpu_ms(e);
             if (l == 0) fwrite(buf, 1, n, fo);
             bytes += n; frames++;
         }
@@ -77,6 +81,7 @@ int main(int argc, char **argv)
     if (!quiet)
         printf("frames %d  bytes/frame %zu  bpp %.3f  q %.2f  encode %.2f ms/frame wall, %.2f ms CPU (%.1f fps)\n", frames,
                bytes / (frames ? frames : 1), bytes * 8.0 / frames / w / h, qs / frames, t_enc / frames * 1e3, c_enc / frames * 1e3, frames / t_enc);
+    if (!quiet && gpu) printf("GPU front end: %.2f ms per frame on the GPU\n", g_ms / (frames ? frames : 1));
     fclose(fo);
     return 0;
 }

@@ -105,6 +105,10 @@ void vc2_enc_defaults(vc2_enc_cfg *c, int width, int height);
 vc2_enc *vc2_enc_new(const vc2_enc_cfg *c);
 void vc2_enc_free(vc2_enc *e);
 size_t vc2_enc_max_size(const vc2_enc *e);
+// The two finest forward levels on the GPU (VC2_GPU_OPENCL, make GPU=cl: Mali / libmali), the same bytes out.
+// LeGall 5,3, depth 4, 10 bit, component widths padded to multiples of 64. 0 if active, -1 if not (CPU then).
+int vc2_enc_set_gpu(vc2_enc *e, int backend);
+double vc2_enc_gpu_ms(const vc2_enc *e); // GPU time of the last frame, -1 without the GPU
 // Encodes one frame of planar samples (LSB-aligned) into out; returns the access unit's size.
 size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_t stride[3], uint8_t *out);
 // End of sequence (13 bytes), to close a file or a stream.

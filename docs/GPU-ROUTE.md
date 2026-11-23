@@ -61,7 +61,10 @@ that.
    coefficient); Firefly 66.7 fps with four threads. The proven bounds (FPGA.md section 6): the finest level's
    bands fit 13 bits, the next 15-16; only the two coarsest need 17. Storing levels 3-4 (three quarters of the
    samples) in 16 bits halves the wavelet's and the counter's memory traffic and doubles the NEON lanes.
-3. **Mali, the encoder's front end (OpenCL, libmali).** Forward wavelet and per-slice counting on the GPU:
+3. **Mali, the encoder's front end (OpenCL, libmali).** First part done 2026-11-23: the two 16-bit levels on the
+   GPU, bit-exact, 1.4-1.9 ms per 1080p frame on the Mali-G610 against about 8 ms on one A76; the encoder's CPU
+   time falls by 5-6 ms per frame, the frame rate not yet (the CPU waits for the GPU). Next: run the GPU one
+   frame ahead (double buffers), then the counting on the GPU (21 ms of CPU per frame). Forward wavelet and per-slice counting on the GPU:
    - the input planes from the dma-heap (a capture or decoder buffer can be imported as a dma-buf, no copy);
    - the wavelet as the decoder's kernel in reverse (blocks of band rows, one launch per band of rows for all
      components);
