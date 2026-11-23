@@ -145,7 +145,16 @@ void vc2_enc_free(vc2_enc *e)
 
 size_t vc2_enc_max_size(const vc2_enc *e)
 {
-    return (size_t)(e->c.width * (double)e->c.height * (e->c.fixed_q > 0 ? 40 : e->c.bpp) / 8) + 4096 + VC2_INPUT_PADDING;
+    // The budget holds unless nothing smaller exists: a fixed quantiser, or explicit zeros (--no-truncate: at
+    // least one bit per coefficient, so even the coarsest quantiser can exceed a low budget), plus the slice
+    // headers and the per-component padding to the size scaler.
+    double bpp = e->c.bpp;
+    if (e->c.fixed_q > 0) bpp = 40;
+    else if (e->c.no_truncate) {
+        double spp = e->c.chroma == 0 ? 3 : e->c.chroma == 1 ? 2 : 1.5; // coefficients per pixel
+        if (bpp < spp + 1) bpp = spp + 1;
+    }
+    return (size_t)(e->c.width * (double)e->c.height * bpp / 8) + (size_t)e->nslices * (4 + 3 * 256) + 4096 + VC2_INPUT_PADDING;
 }
 int vc2_enc_last_q(const vc2_enc *e) { return (int)(e->q_sum * 100 / e->nslices); }
 
