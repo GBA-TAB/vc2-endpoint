@@ -218,6 +218,11 @@ reading 16 MB per 1080p frame. The same bytes (`scripts/enc-check.sh` with `VC2_
 
 So both boards now encode 1080p50 at 3 bpp on two cores, without the GPU.
 
+Checked after these changes (2026-11-23): `scripts/verify.sh` 254 of 254 (ffmpeg decodes our streams as we do);
+AddressSanitizer + UBSan (without the shift-of-negative check: the wavelet's `<< 1` on negative samples is meant
+as two's complement) over 320 runs each on x86 and on the Pi 5 (sizes 34x34 to 3840x2160, 1-5 threads, depths 3-5,
+both wavelets, truncation off, fixed q, small slices, slice cap) and 180 GPU runs on the Firefly: no report.
+
 **The front end on Mali (`make GPU=cl`, `vc2enc --gpu cl`).** The two 16-bit levels as an OpenCL kernel
 (`lib/vc2_fwd.cl`, `lib/vc2_enc_cl.c`): one work-item per 8 band columns and 16 band rows, horizontal lifting
 per row, the vertical steps in a rolling window, one row pair recomputed above each strip. Bit-exact: all 5.2
