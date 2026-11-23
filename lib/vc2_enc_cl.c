@@ -5,6 +5,8 @@
 #define CL_TARGET_OPENCL_VERSION 300
 #include "vc2_enc_gpu.h"
 #include <CL/cl.h>
+#include <CL/cl_ext.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +20,13 @@ extern const char vc2_fwd_cl_src[];
 
 typedef struct { int q; cl_mem mem; uint32_t *map; } slot;
 
+typedef cl_mem (*import_fn)(cl_context, cl_mem_flags, const cl_import_properties_arm *, void *, size_t, cl_int *);
 struct vc2_encgpu {
+    import_fn import;
+    cl_mem raw;                            // the caller's picture, imported (cl_arm_import_memory_host)
+    const void *raw_base;
+    size_t raw_size;
+    int raw_off[3], raw_stride[3], raw_h, raw_max, raw_offset, use_raw;
     cl_context ctx;
     cl_command_queue q;
     cl_program prog;
@@ -59,6 +67,7 @@ void vc2_encgpu_free(vc2_encgpu *g)
     }
     for (int i = 0; i < NSLOT; i++) if (g->sl[i].mem) clReleaseMemObject(g->sl[i].mem);
     if (g->bands) clReleaseMemObject(g->bands);
+    if (g->raw) clReleaseMemObject(g->raw);
     if (g->desc) clReleaseMemObject(g->desc);
     if (g->r16) clReleaseMemObject(g->r16);
     if (g->q) clFinish(g->q);
@@ -96,6 +105,7 @@ vc2_encgpu *vc2_encgpu_new(const int pw[3], int ph, int nx)
         fprintf(stderr, "vc2: GPU front end: kernel build failed\n%s\n", log);
         goto fail;
     }
+    g->import = (import_fn)clGetExtensionFunctionAddressForPlatform(pl, "clImportMemoryARM");
     g->k = clCreateKernel(g->prog, "fwd53", &err);
     if (err) goto fail;
     g->kc = clCreateKernel(g->prog, "count16", &err);
@@ -148,6 +158,33 @@ fail:
     return 0;
 }
 
+int vc2_encgpu_use_picture(vc2_encgpu *g, const uint16_t *const plane[3], const ptrdiff_t stride[3], int h, int bit_depth)
+{
+    g->use_raw = 0;
+    if (!g->import || getenv("VC2_GPU_NO_IMPORT")) return -1;
+    // one import covering the three planes, page-aligned (the pages around the picture belong to the caller too)
+    uintptr_t lo = (uintptr_t)-1, hi = 0;
+    for (int c = 0; c < 3; c++) {
+        if (stride[c] < g->pw[c]) return -1; // the kernel reads whole padded rows: the picture must be that wide
+        uintptr_t a = (uintptr_t)plane[c], b = a + ((size_t)(h - 1) * stride[c] + g->pw[c]) * 2;
+        if (a & 1) return -1;
+        lo = a < lo ? a : lo; hi = b > hi ? b : hi;
+    }
+    uintptr_t base = lo & ~(uintptr_t)4095, end = (hi + 4095) & ~(uintptr_t)4095;
+    if ((const void *)base != g->raw_base || end - base != g->raw_size) {
+        if (g->raw) { clReleaseMemObject(g->raw); g->raw = 0; }
+        const cl_import_properties_arm props[] = { CL_IMPORT_TYPE_ARM, CL_IMPORT_TYPE_HOST_ARM, 0 };
+        cl_int err;
+        g->raw = g->import(g->ctx, CL_MEM_READ_ONLY, props, (void *)base, end - base, &err);
+        if (err || !g->raw) { g->raw = 0; g->raw_base = 0; return -1; }
+        g->raw_base = (const void *)base; g->raw_size = end - base;
+    }
+    for (int c = 0; c < 3; c++) { g->raw_off[c] = (int)(((uintptr_t)plane[c] - base) / 2); g->raw_stride[c] = (int)stride[c]; }
+    g->raw_h = h; g->raw_max = (1 << bit_depth) - 1; g->raw_offset = 1 << (bit_depth - 1);
+    g->use_raw = 1;
+    return 0;
+}
+
 int16_t *vc2_encgpu_input(vc2_encgpu *g, int c)
 {
     cl_int err;
@@ -175,12 +212,19 @@ int vc2_encgpu_run(vc2_encgpu *g, int16_t *b4[3][4], int16_t *b3[3][4], double *
         for (int c = 0; c < 3; c++) {
             cl_int w = lv ? g->pw[c] / 4 : g->pw[c] / 2, h = lv ? g->ph / 4 : g->ph / 2, is = 2 * w;
             cl_mem in = lv ? g->sub4[c][0] : g->in[c], *o = lv ? g->sub3[c] : g->sub4[c];
+            cl_int raw = !lv && g->use_raw, hin = raw ? g->raw_h : 2 * h, maxv = g->raw_max, off = g->raw_offset, inoff = raw ? g->raw_off[c] : 0;
+            if (raw) { in = g->raw; is = g->raw_stride[c]; }
             err |= clSetKernelArg(g->k, 0, sizeof in, &in);
             err |= clSetKernelArg(g->k, 1, 4, &is);
             err |= clSetKernelArg(g->k, 2, 4, &w);
             err |= clSetKernelArg(g->k, 3, 4, &h);
             err |= clSetKernelArg(g->k, 4, 4, &rb);
             for (int b = 0; b < 4; b++) err |= clSetKernelArg(g->k, 5 + b, sizeof o[b], &o[b]);
+            err |= clSetKernelArg(g->k, 9, 4, &raw);
+            err |= clSetKernelArg(g->k, 10, 4, &hin);
+            err |= clSetKernelArg(g->k, 11, 4, &maxv);
+            err |= clSetKernelArg(g->k, 12, 4, &off);
+            err |= clSetKernelArg(g->k, 13, 4, &inoff);
             size_t gs[2] = { (size_t)w / 8, (size_t)(h + RB - 1) / RB };
             err |= clEnqueueNDRangeKernel(g->q, g->k, 2, 0, gs, 0, 0, 0, &ev[lv * 3 + c]);
             if (err) return -1;

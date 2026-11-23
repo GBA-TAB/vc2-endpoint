@@ -5,13 +5,24 @@
 // clamped. One work-item = 8 band columns x RB band rows; it recomputes one row pair above its strip.
 typedef struct { short8 lo, hi; } R;
 
-static R hrow(__global const short *in, int istride, int w, int k0, int y)
+// raw = 1: the input is the caller's picture (unsigned samples, hin rows, the rows below repeat the last):
+// clamped to maxv and the offset removed here, as the CPU does when it fills the input buffer
+static short16 ld16(__global const short *r, int raw, int maxv, int off)
 {
-    __global const short *r = in + (size_t)y * istride;
-    short16 v = vload16(0, r + 2 * k0);
+    short16 v = vload16(0, r);
+    return raw ? convert_short16(min(as_ushort16(v), (ushort16)maxv)) - (short16)off : v;
+}
+static short ld1(__global const short *r, int raw, int maxv, int off)
+{
+    return raw ? (short)(min((int)as_ushort(*r), maxv) - off) : *r;
+}
+static R hrow(__global const short *in, int istride, int w, int k0, int y, int raw, int hin, int maxv, int off)
+{
+    __global const short *r = in + (size_t)(y < hin ? y : hin - 1) * istride;
+    short16 v = ld16(r + 2 * k0, raw, maxv, off);
     short8 lo = v.even << (short8)1, hi = v.odd << (short8)1;
     int km = k0 > 0 ? k0 - 1 : 0, kp = k0 + 8 < w ? k0 + 8 : w - 1;
-    short lom = (short)(r[2 * km] << 1), him = (short)(r[2 * km + 1] << 1), lop = (short)(r[2 * kp] << 1);
+    short lom = (short)(ld1(r + 2 * km, raw, maxv, off) << 1), him = (short)(ld1(r + 2 * km + 1, raw, maxv, off) << 1), lop = (short)(ld1(r + 2 * kp, raw, maxv, off) << 1);
     short8 lon = (short8)(lo.s1234, lo.s567, lop);
     short8 hp = hi - ((lo + lon + (short8)1) >> (short8)1);
     short hpm = k0 > 0 ? (short)(him - ((lom + lo.s0 + 1) >> 1)) : hp.s0;
@@ -21,19 +32,21 @@ static R hrow(__global const short *in, int istride, int w, int k0, int y)
 }
 
 __kernel void fwd53(__global const short *in, int istride, int w, int h, int rb,
-                    __global short *ll, __global short *hl, __global short *lh, __global short *hh)
+                    __global short *ll, __global short *hl, __global short *lh, __global short *hh,
+                    int raw, int hin, int maxv, int off, int inoff)
 {
+    in += inoff;
     const int k0 = get_global_id(0) * 8, r0 = get_global_id(1) * rb;
     if (k0 >= w || r0 >= h) return;
     const int r1 = r0 + rb < h ? r0 + rb : h;
     int s = r0 > 0 ? r0 - 1 : 0;
-    R c0 = hrow(in, istride, w, k0, 2 * s), c1 = hrow(in, istride, w, k0, 2 * s + 1);
-    R n0 = hrow(in, istride, w, k0, 2 * (s + 1 < h ? s + 1 : h - 1));
+    R c0 = hrow(in, istride, w, k0, 2 * s, raw, hin, maxv, off), c1 = hrow(in, istride, w, k0, 2 * s + 1, raw, hin, maxv, off);
+    R n0 = hrow(in, istride, w, k0, 2 * (s + 1 < h ? s + 1 : h - 1), raw, hin, maxv, off);
     R x1 = { c1.lo - ((c0.lo + n0.lo + (short8)1) >> (short8)1), c1.hi - ((c0.hi + n0.hi + (short8)1) >> (short8)1) };
     R p1 = x1; // X1'[i - 1], clamped at the top
     if (s < r0) {
-        c0 = n0; c1 = hrow(in, istride, w, k0, 2 * r0 + 1);
-        n0 = hrow(in, istride, w, k0, 2 * (r0 + 1 < h ? r0 + 1 : h - 1));
+        c0 = n0; c1 = hrow(in, istride, w, k0, 2 * r0 + 1, raw, hin, maxv, off);
+        n0 = hrow(in, istride, w, k0, 2 * (r0 + 1 < h ? r0 + 1 : h - 1), raw, hin, maxv, off);
         x1.lo = c1.lo - ((c0.lo + n0.lo + (short8)1) >> (short8)1);
         x1.hi = c1.hi - ((c0.hi + n0.hi + (short8)1) >> (short8)1);
     }
@@ -42,8 +55,8 @@ __kernel void fwd53(__global const short *in, int istride, int w, int h, int rb,
         size_t o = (size_t)i * w + k0;
         vstore8(xl, 0, ll + o); vstore8(xh, 0, hl + o); vstore8(x1.lo, 0, lh + o); vstore8(x1.hi, 0, hh + o);
         if (i + 1 < r1) {
-            p1 = x1; c0 = n0; c1 = hrow(in, istride, w, k0, 2 * (i + 1) + 1);
-            n0 = hrow(in, istride, w, k0, 2 * (i + 2 < h ? i + 2 : h - 1));
+            p1 = x1; c0 = n0; c1 = hrow(in, istride, w, k0, 2 * (i + 1) + 1, raw, hin, maxv, off);
+            n0 = hrow(in, istride, w, k0, 2 * (i + 2 < h ? i + 2 : h - 1), raw, hin, maxv, off);
             x1.lo = c1.lo - ((c0.lo + n0.lo + (short8)1) >> (short8)1);
             x1.hi = c1.hi - ((c0.hi + n0.hi + (short8)1) >> (short8)1);
         }

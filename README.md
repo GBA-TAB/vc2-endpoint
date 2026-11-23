@@ -226,6 +226,12 @@ bands, the truncation decisions and the writer. The same bytes out as the CPU pa
 
 So 1080p50 takes two A76 cores and the Mali. `VC2_NO_GPU_COUNT=1` keeps the counting on the CPU.
 
+The GPU reads the caller's picture itself when the padded width equals the picture's (1280, 1920, 3840): the
+planes are imported once (`cl_arm_import_memory_host`; libmali keeps them coherent, checked over 200 changing
+frames) and the kernel does the clamp, the offset and the padding rows, so the CPU no longer copies the input.
+CPU per frame 25.4 -> 23.3 ms (1080p, four threads), 100 -> 93 ms (UHD), the same bytes (90 cases).
+`VC2_GPU_NO_IMPORT=1` keeps the copy.
+
 ## 3. Decoder
 
 - **Entropy decoding**: a 12-bit lookup yields all coefficients complete within those bits (up to 12 zeros,

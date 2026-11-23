@@ -370,8 +370,13 @@ static void gpu_coarse_job(void *arg, int job, int thread)
 }
 static int gpu_wavelet(vc2_enc *e)
 {
-    for (int c = 0; c < 3; c++) if (!vc2_encgpu_input(e->gpu, c)) return -1;
-    vc2_pool_run(e->pool, gpu_in_job, e, 3);
+    // the GPU reads the caller's picture itself when it can (no copy), else the CPU fills its input buffer
+    int whole = 1; // the kernel reads whole padded rows: only when the picture is that wide
+    for (int c = 0; c < 3; c++) whole &= e->pl[c].g.pw == e->pl[c].g.w;
+    if (!whole || vc2_encgpu_use_picture(e->gpu, e->in, e->in_stride, e->pl[0].g.h, e->c.bit_depth)) {
+        for (int c = 0; c < 3; c++) if (!vc2_encgpu_input(e->gpu, c)) return -1;
+        vc2_pool_run(e->pool, gpu_in_job, e, 3);
+    }
     int16_t *b4[3][4], *b3[3][4];
     if (vc2_encgpu_run(e->gpu, b4, b3, &e->gpu_ms)) return -1;
     for (int c = 0; c < 3; c++) {
