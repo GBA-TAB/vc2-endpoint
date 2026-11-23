@@ -73,8 +73,21 @@ that.
      for one more frame of latency.
    - *Coalesced counting* (eight neighbouring values per work-item, sums per slice in local memory): slower on
      the Mali-G610 (GPU 5.4 -> 6.3 ms per 1080p frame); its caches already serve the per-segment loop.
-   What is left on the GPU side: fewer counting round trips per frame (several quantisers in one launch, which
-   on the GPU costs nothing extra in rows, unlike on the CPU). Forward wavelet and per-slice counting on the GPU:
+   - *Two quantisers per counting launch* (q and q - 1, the loads shared): no change in GPU or wall time; the
+     launches are not what costs.
+   - *The exact 16-bit integer counter on the GPU*: 1.59 against 0.67 ms per pass in float; the Mali's 16-bit
+     `mul_hi` is not native. (The Mali's clock follows `simple_ondemand`, 300-850 MHz, so short GPU timings vary
+     by about 20 %.)
+   At 1080p the GPU is busy about 3.5 ms per 20 ms frame; the rest is CPU work.
+
+Tried on the CPU overnight 2026-11-23 and dropped (all byte-identical, patches in the research folder):
+- *Eight zeros at once in the writer*: slower (the test costs more than the runs it finds).
+- *Eight codes per NEON step in the writer* (codes by carry-less square, merged pairwise): covers 98 % of the
+  coefficients but the row loop is only 8 % faster; each group still has to go through the bit writer's running
+  word one after the other (about 47 cycles per eight values).
+- *The 16-bit counter and quantisation in AVX2*: 1.4 % less CPU on x86 (float conversions are cheap there).
+Kept: the writer's 16-bit quantisation in NEON integers (-1.1 ms per frame on the Firefly) and the 16-bit levels
+in strips (Firefly four threads 68 -> 74 fps). Forward wavelet and per-slice counting on the GPU:
    - the input planes from the dma-heap (a capture or decoder buffer can be imported as a dma-buf, no copy);
    - the wavelet as the decoder's kernel in reverse (blocks of band rows, one launch per band of rows for all
      components);
