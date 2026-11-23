@@ -675,6 +675,27 @@ static inline __attribute__((always_inline)) int count_row32v(const int32_t *c, 
 #endif
 }
 
+// The writer's quantisation of a 32-bit row, quant_row_w's float arithmetic in four NEON lanes, inlined. Returns
+// -1 where it does not apply (then quant_row), else 0 or 1 as quant_row.
+static inline __attribute__((always_inline)) int quant_row32v(const int32_t *c, int w, float r16, int32_t *v)
+{
+#ifdef __aarch64__
+    if (w < 4 || (w & 3)) return -1;
+    const float32x4_t r = vdupq_n_f32(r16);
+    uint32x4_t any = vdupq_n_u32(0);
+    for (int x = 0; x < w; x += 4) {
+        int32x4_t cv = vld1q_s32(c + x);
+        int32x4_t q = vshrq_n_s32(vcvtq_s32_f32(vmulq_f32(vcvtq_f32_s32(vshlq_n_s32(vabsq_s32(cv), 2)), r)), 4);
+        any = vorrq_u32(any, vreinterpretq_u32_s32(q));
+        vst1q_s32(v + x, vbslq_s32(vcltzq_s32(cv), vnegq_s32(q), q));
+    }
+    return vmaxvq_u32(any) != 0;
+#else
+    (void)c; (void)w; (void)r16; (void)v;
+    return -1;
+#endif
+}
+
 // The 16-bit rows' counter: the arithmetic of count_row_w in exact integers, eight lanes of 16 bits (NEON).
 // bits = 2 J + 1 + [v > 0] with J = floor(log2(v + 1)); dd = (2 vv + 1)(uu - 8 vv - 4) for v > 0, where vv = min(v, 255)
 // and uu = min(16 v + f, 4096): for v <= 255 that is (2v + 1)(8v + f - 4), above it the constant 511 * 2052.
@@ -932,6 +953,11 @@ static void vlc_init(void)
 }
 
 // One slice row: quantise band row by band row into per-slice buffers in coding order, then write the slices.
+static inline int quant_row32(const int32_t *c, int w, float r16, int32_t *v)
+{
+    int k = getenv_no16c ? -1 : quant_row32v(c, w, r16, v);
+    return k >= 0 ? k : quant_row(c, w, r16, v);
+}
 static void write_job(void *arg, int sy, int thread)
 {
     vc2_enc *e = arg;
@@ -964,7 +990,7 @@ static void write_job(void *arg, int sy, int thread)
                         int wd = xs[sx + 1] - xs[sx];
                         const int qq = q < 0 ? 0 : q;
                         gv[wd] = row16 ? (getenv_no16c ? quant_row16(row16 + xs[sx], wd, e->r16[qq], gv) : quant_row16v(row16 + xs[sx], wd, &e->c16[qq], e->r16[qq], gv))
-                                       : quant_row(row + xs[sx], wd, e->r16[qq], gv);
+                                       : quant_row32(row + xs[sx], wd, e->r16[qq], gv);
                     }
                     off += (p->g.bw[l] + nx - 1) / nx + 1;
                 }
