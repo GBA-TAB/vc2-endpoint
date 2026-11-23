@@ -96,6 +96,10 @@ Tried on the CPU overnight 2026-11-23 and dropped (all byte-identical, patches i
   coefficients but the row loop is only 8 % faster; each group still has to go through the bit writer's running
   word one after the other (about 47 cycles per eight values).
 - *The 16-bit counter and quantisation in AVX2*: 1.4 % less CPU on x86 (float conversions are cheap there).
+- *The RK3588's A55 cores as extra encoder threads*: four A76 alone 95 fps; with the A55 too 56-62 fps (a wavelet
+  strip on a slow core holds the level up), 90 fps with eight strips. The encoder belongs on the A76 cores; the
+  A55 can carry side work such as the sending thread.
+- *The zero-segment exit in the float counters (x86) and in the GPU kernel*: slightly slower in both.
 Kept: the writer's 16-bit quantisation in NEON integers (-1.1 ms per frame on the Firefly) and the 16-bit levels
 in strips (Firefly four threads 68 -> 74 fps). Forward wavelet and per-slice counting on the GPU:
    - the input planes from the dma-heap (a capture or decoder buffer can be imported as a dma-buf, no copy);
