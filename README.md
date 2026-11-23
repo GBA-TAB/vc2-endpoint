@@ -496,6 +496,22 @@ No packet was lost or late in any run, and the decoder stays 0.3-0.4 ms behind t
 The arrival jitter is the sender's: an idle Pi 5 paces within 0.6 ms, the busy x86 host (a shared core, normal
 scheduling) and the Firefly show single late frames of 7-14 ms. A real sender paces from a real-time thread.
 
+**Live encoding** (`vc2send --encode WxH`, 2026-11-23): every frame of a looped 16-bit 4:2:2 source is encoded
+at its slot (slices capped to the MTU) and handed to a sending thread, which paces its packets over half the
+period while the next frame is encoded. Firefly -> Pi 5 over the office LAN, 1080p50 at 3 bpp, 1000 frames:
+
+| Firefly encoder | encode avg / max | frames past their slot | Pi 5 receiver: lost, first packet / last packet to last line |
+|---|---|---:|---|
+| CPU, 4 x A76 | 13.3 / 42.1 ms | 6 | 0 lost, 13.7 / 0.30 ms |
+| CPU 4 + Mali front end | 15.8 / 35.1 ms | 14 | 0 lost, 13.7 / 0.31 ms |
+| CPU 3 + Mali | 17.3 / 35.2 ms | 33 | 0 lost |
+| CPU 2 + Mali | 20.1 / 43.2 ms | all (the stream falls behind) | 0 lost |
+
+So the Firefly encodes and sends live 1080p50 on its four A76 cores, and the Pi 5 decodes it 0.3 ms after the
+last packet. Live, the Mali path is slower than in the encoder benchmark (17.9 ms with two threads there): the GPU
+idles between frames and its governor (`simple_ondemand`, 300-850 MHz) kept it at 500 MHz. A fixed GPU clock is a
+setting of the board, not of this code.
+
     build/vc2enc --bpp 3 --max-slice 1168 in.yuv rtp.vc2
     sudo taskset -c 5 build/vc2recv --port 5870 --frames 300 --out rx.yuv --out-skip 200 --out-frames 20 &
     taskset -c 6 build/vc2send --port 5870 --frames 300 [--loss 5] [--reorder 50] [--spread 0.1] rtp.vc2
@@ -503,6 +519,8 @@ scheduling) and the Firefly show single late frames of 7-14 ms. A real sender pa
     # destination outside loopback; multicast, broadcast and 172.30.3.0/24 are refused
     sudo taskset -c 5 build/vc2recv --bind 0.0.0.0 --port 5872 --frames 500 &
     build/vc2send --network --dst 192.168.98.162 --port 5872 --frames 500 rtp.vc2
+    # live: encode a looped source in real time and send it
+    build/vc2send --encode 1920x1080 --threads 4 --bpp 3 --fps 50 --spread 0.5 --network --dst 192.168.98.116 in.yuv
     build/vc2send --sdp rtp.vc2
 
 ## 8. Open
