@@ -568,6 +568,34 @@ static inline __attribute__((always_inline)) void count_row16v(const int16_t *c,
     count_row16(c, w, r16, bits, dd, nz);
 }
 
+// The writer's quantisation of a 16-bit row with the counter's exact integer constants (v = floor(4|c| / qf) =
+// what quant_row16 computes on that range): signed values into v[0..w), returns 0 if all are 0.
+static inline int quant_row16v(const int16_t *c, int w, const cnt16 *t, float r16, int32_t *out)
+{
+    if (t->mode == 2) return 0; // every value 0: the writer then reads only the flag
+#ifdef __aarch64__
+    if (t->mode == 1 && w >= 8 && !(w & 7)) {
+        const uint16x8_t m = vdupq_n_u16(t->m);
+        const int16x8_t sh = vdupq_n_s16(-(int16_t)(t->s - t->av));
+        const int av = t->av;
+        uint16x8_t any = vdupq_n_u16(0);
+        for (int x = 0; x < w; x += 8) {
+            int16x8_t cv = vld1q_s16(c + x);
+            uint16x8_t n = vshlq_n_u16(vreinterpretq_u16_s16(vabsq_s16(cv)), 2);
+            uint16x8_t hv = mulhi16(n, m);
+            uint16x8_t v = vshlq_u16(av ? vhaddq_u16(n, hv) : hv, sh);
+            any = vorrq_u16(any, v);
+            int16x8_t sv = vreinterpretq_s16_u16(v);
+            sv = vbslq_s16(vcltzq_s16(cv), vnegq_s16(sv), sv); // the sign of c
+            vst1q_s32(out + x, vmovl_s16(vget_low_s16(sv)));
+            vst1q_s32(out + x + 4, vmovl_high_s16(sv));
+        }
+        return vmaxvq_u16(any) != 0;
+    }
+#endif
+    return quant_row16(c, w, r16, out);
+}
+
 // Sizes of the slices of one slice row at quantiser index qi: bytes per component, and the rows kept (coding
 // order). Works band row by band row, so the coefficient memory is read in order.
 static void count_slice_row(vc2_enc *e, escratch *s, int sy, int qi, uint16_t *bytes, uint16_t *cuts)
@@ -769,7 +797,9 @@ static void write_job(void *arg, int sy, int thread)
                         int32_t *gv = gc[c] + per_slice * sx + off;
                         // an all-zero row is marked in its spare last entry and written as a run of ones
                         int wd = xs[sx + 1] - xs[sx];
-                        gv[wd] = row16 ? quant_row16(row16 + xs[sx], wd, e->r16[q < 0 ? 0 : q], gv) : quant_row(row + xs[sx], wd, e->r16[q < 0 ? 0 : q], gv);
+                        const int qq = q < 0 ? 0 : q;
+                        gv[wd] = row16 ? (getenv_no16c ? quant_row16(row16 + xs[sx], wd, e->r16[qq], gv) : quant_row16v(row16 + xs[sx], wd, &e->c16[qq], e->r16[qq], gv))
+                                       : quant_row(row + xs[sx], wd, e->r16[qq], gv);
                     }
                     off += (p->g.bw[l] + nx - 1) / nx + 1;
                 }

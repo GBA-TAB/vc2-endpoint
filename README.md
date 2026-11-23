@@ -179,7 +179,9 @@ and 54) keep the generic counter, and for the 61 coarsest every value of such a 
 123 cases on both boards (three clips including the worst-case picture, fixed q 0-60). It gains less than the
 operation count promised, because the A76 has one vector multiply pipe and each coefficient needs seven:
 counting 23.8 -> 21.7 ms (Pi 5) and 23.5 -> 21.2 ms (Firefly) per frame on one core; four threads: Pi 5
-51-54 -> 56 fps, Firefly 63-64 -> 66.7 fps. `VC2_NO16C=1` turns it off.
+51-54 -> 56 fps, Firefly 63-64 -> 66.7 fps. `VC2_NO16C=1` turns it off. The writer's quantisation of those rows
+uses the same exact constants (it needs only v): Firefly writer 11.8 -> 10.7 ms per frame on one core, four
+threads 65.6 -> 67.4 fps, the same bytes in 120 cases on both boards.
 
 **The front end on Mali (`make GPU=cl`, `vc2enc --gpu cl`).** The two 16-bit levels as an OpenCL kernel
 (`lib/vc2_fwd.cl`, `lib/vc2_enc_cl.c`): one work-item per 8 band columns and 16 band rows, horizontal lifting
