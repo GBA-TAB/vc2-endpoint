@@ -11,7 +11,7 @@ ENC=$B/vc2enc
 T=$(mktemp -d "${TMPDIR:-/tmp}/enc-check.XXXXXX") && trap 'rm -rf "$T"' EXIT
 bad=0; n=0
 # switch: the plain path to compare with (each fast path has one)
-SWITCHES="VC2_NO16=1 VC2_NO16C=1 VC2_WV_STRIPS=1"
+SWITCHES="VC2_NO16=1 VC2_NO16C=1 VC2_WV_STRIPS=1 VC2_NO_RAWIN=1"
 one() { # one() name env... -- args
     ref=$1; shift
     env $ref "$ENC" "$@" "$T/a.vc2" >/dev/null 2>&1 || return 0

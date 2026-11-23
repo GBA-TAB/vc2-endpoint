@@ -205,6 +205,19 @@ inlined in four NEON lanes (the conversions and the multiply round as the scalar
 and 864 cases identical on the Pi 5 and the Firefly). Counting per 1080p frame on one core: Firefly 16.1 -> 13.9
 ms, Pi 5 18.2 -> 15.8 ms; four threads: **Firefly 82.5 -> 87 fps, Pi 5 59.4 -> 62.7 fps**.
 
+**No input copy.** The Pi 5's wavelet was bound by memory: with four threads 2.1 ms of its 7.8 went to copying
+the picture into a 16-bit plane, and four threads were slower than two. The finest level now reads the caller's
+picture itself (clamp, offset, padding rows and columns while it loads a row pair), which saves writing and
+reading 16 MB per 1080p frame. The same bytes (`scripts/enc-check.sh` with `VC2_NO_RAWIN=1` as the plain path:
+624 and 732 cases). 1080p 3 bpp:
+
+| | two threads | four threads |
+|---|---:|---:|
+| Pi 5 | 49.0 -> **53.5 fps** | 63.0 -> **71.7 fps** |
+| Firefly | 52.2 -> **54.4 fps** | 89 -> **92-96 fps** |
+
+So both boards now encode 1080p50 at 3 bpp on two cores, without the GPU.
+
 **The front end on Mali (`make GPU=cl`, `vc2enc --gpu cl`).** The two 16-bit levels as an OpenCL kernel
 (`lib/vc2_fwd.cl`, `lib/vc2_enc_cl.c`): one work-item per 8 band columns and 16 band rows, horizontal lifting
 per row, the vertical steps in a rolling window, one row pair recomputed above each strip. Bit-exact: all 5.2

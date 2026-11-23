@@ -47,6 +47,7 @@ typedef struct { uint16_t m, m2, qf; uint8_t s, s2, k, mode, av, af; } cnt16; //
 static const cnt16 c16_off = { 0 };
 static int getenv_no16c = -1; // VC2_NO16C=1: the 16-bit rows through the generic counter
 static int getenv_nogc;       // VC2_NO_GPU_COUNT=1: with the GPU front end, count on the CPU
+static int getenv_norawin;    // VC2_NO_RAWIN=1: the input copied into a 16-bit plane before the wavelet
 #define WV_H 4 // halo row pairs of a wavelet strip (analyse_strip16)
 typedef struct { rowref *rows; uint32_t *bits, *dd; int32_t *tmp, *gather; uint8_t *obuf; int16_t *halo; } escratch;
 
@@ -61,7 +62,7 @@ struct vc2_enc {
     // levels l >= l16 are transformed and stored in 16 bits: LeGall 5,3, depth 4, 10-bit, where the bounds are
     // proven (every band and every sum inside a lifting step of the two finest levels below 32768); else depth + 1
     int l16;
-    int wv_level, wv_job[64][3], wv_strips; // the 16-bit levels in strips: the level being run, (plane, strip, strips)
+    int wv_level, wv_job[64][3], wv_strips, wv_raw; // the 16-bit levels in strips: the level being run, (plane, strip, strips)
     vc2_encgpu *gpu;            // the GPU front end, when set (vc2_enc_set_gpu)
     double gpu_ms;
     int gpu_frame;              // this frame's 16-bit bands came from the GPU
@@ -195,6 +196,7 @@ vc2_enc *vc2_enc_new(const vc2_enc_cfg *c)
     if (getenv_no16c < 0) getenv_no16c = getenv("VC2_NO16C") != 0;
     e->wv_strips = getenv("VC2_WV_STRIPS") ? atoi(getenv("VC2_WV_STRIPS")) : 0; // 0: automatic, 1: one job per plane
     getenv_nogc = getenv("VC2_NO_GPU_COUNT") != 0;
+    getenv_norawin = getenv("VC2_NO_RAWIN") != 0;
     e->sq = malloc(e->nslices);
     e->soff = malloc((e->nslices + 1) * sizeof *e->soff);
     e->last_q = 24; e->scaler = 1;
@@ -404,8 +406,11 @@ static inline int16_t *row16(int16_t *const bands[4], int16_t *halo, int k, int 
 // starts WV_H row pairs early and ends WV_H late; those rows go to the thread's own halo buffer (2 WV_H rows per
 // band), never to the bands, which hold only the rows the strip owns. With the 5,3 steps a row's error reaches one
 // row, so the owned rows equal the whole-level transform (checked by comparing the output with VC2_WV_STRIPS=1).
+// raw: the finest level reads the caller's picture itself (clamp to the bit depth, offset, padding rows and
+// columns repeated), so the picture is not first copied into a 16-bit plane; 0 = read `in`
+typedef struct { const uint16_t *p; ptrdiff_t stride; int w, h, max, off; } rawin;
 static void analyse_strip16(const vc2_wavelet *wl, const int16_t *in, ptrdiff_t istride, int w, int h, int16_t *bands[4], int16_t *tmp,
-                            int r0, int r1, int16_t *halo)
+                            int r0, int r1, int16_t *halo, const rawin *raw)
 {
     const int ns = wl->nsteps, sh = wl->shift, hw = (w + 2 * VC2_G + 7) & ~7;
     const int ps = r0 - WV_H > 0 ? r0 - WV_H : 0, pe = r1 + WV_H < h ? r1 + WV_H : h;
@@ -419,8 +424,23 @@ static void analyse_strip16(const vc2_wavelet *wl, const int16_t *in, ptrdiff_t 
     for (int p = ps; p <= pe; p++) {
         if (p < pe) {
             for (int y = 2 * p; y < 2 * p + 2; y++) {
-                const int16_t *r = in + (size_t)y * istride;
-                for (int x = 0; x < w; x++) { lo[x] = (int16_t)(r[2 * x] << sh); hi[x] = (int16_t)(r[2 * x + 1] << sh); }
+                if (raw) {
+                    const uint16_t *r = raw->p + (size_t)(y < raw->h ? y : raw->h - 1) * raw->stride;
+                    const int mx = raw->max, of = raw->off;
+                    if (2 * w <= raw->w)
+                        for (int x = 0; x < w; x++) {
+                            int a = r[2 * x], b = r[2 * x + 1];
+                            lo[x] = (int16_t)(((a > mx ? mx : a) - of) << sh); hi[x] = (int16_t)(((b > mx ? mx : b) - of) << sh);
+                        }
+                    else
+                        for (int x = 0; x < w; x++) {
+                            int a = r[2 * x < raw->w ? 2 * x : raw->w - 1], b = r[2 * x + 1 < raw->w ? 2 * x + 1 : raw->w - 1];
+                            lo[x] = (int16_t)(((a > mx ? mx : a) - of) << sh); hi[x] = (int16_t)(((b > mx ? mx : b) - of) << sh);
+                        }
+                } else {
+                    const int16_t *r = in + (size_t)y * istride;
+                    for (int x = 0; x < w; x++) { lo[x] = (int16_t)(r[2 * x] << sh); hi[x] = (int16_t)(r[2 * x + 1] << sh); }
+                }
                 for (int j = ns - 1; j >= 0; j--) vc2_lift_h_16(lo, hi, w, &wl->st[j], -wl->st[j].sign);
                 memcpy(ROW((y & 1) * 2, y / 2), lo, w * 2);
                 memcpy(ROW((y & 1) * 2 + 1, y / 2), hi, w * 2);
@@ -473,7 +493,9 @@ static void wv_strip_job(void *arg, int job, int thread)
     const int h = p->g.bh[l], r0 = (int)((int64_t)h * k / n), r1 = (int)((int64_t)h * (k + 1) / n);
     const int16_t *in = l == e->c.depth ? p->img16 : p->ll16[l];
     int16_t *bands[4] = { p->ll16[l - 1], p->band16[l][1], p->band16[l][2], p->band16[l][3] };
-    analyse_strip16(e->wl, in, 2 * p->g.bw[l], p->g.bw[l], h, bands, (int16_t *)e->scr[thread].tmp, r0, r1, e->scr[thread].halo);
+    rawin ri = { e->in[c], e->in_stride[c], p->g.w, p->g.h, (1 << e->c.bit_depth) - 1, 1 << (e->c.bit_depth - 1) };
+    analyse_strip16(e->wl, in, 2 * p->g.bw[l], p->g.bw[l], h, bands, (int16_t *)e->scr[thread].tmp, r0, r1, e->scr[thread].halo,
+                    l == e->c.depth && e->wv_raw ? &ri : 0);
 }
 static void wv_rest_job(void *arg, int job, int thread)
 {
@@ -492,7 +514,8 @@ static void wv_rest_job(void *arg, int job, int thread)
 static void wavelet_strips(vc2_enc *e)
 {
     const int th = vc2_pool_threads(e->pool);
-    vc2_pool_run(e->pool, wv_in_job, e, 3);
+    e->wv_raw = !getenv_norawin; // the finest level reads the picture itself, without the input copy
+    if (!e->wv_raw) vc2_pool_run(e->pool, wv_in_job, e, 3);
     for (int l = e->c.depth; l >= e->l16; l--) {
         int nj = 0;
         for (int c = 0; c < 3; c++) {
@@ -1065,7 +1088,7 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
         for (int c = 0; c < 3; c++) for (int l = 0; l <= VC2_MAX_DEPTH; l++) for (int o = 0; o < 4; o++) e->pl[c].band16[l][o] = e->pl[c].own16[l][o];
     }
     if (!e->gpu) {
-        if (e->l16 <= e->c.depth && e->wv_strips != 1 && vc2_pool_threads(e->pool) > 1) wavelet_strips(e);
+        if (e->l16 <= e->c.depth && e->wv_strips != 1) wavelet_strips(e);
         else vc2_pool_run(e->pool, plane_job, e, 3);
     }
     double t1 = now();
