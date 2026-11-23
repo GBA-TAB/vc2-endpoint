@@ -199,6 +199,12 @@ such a segment (one bit per value, no truncation cost; the writer reads only the
 21.1 -> 16.1 ms, Pi 5 21.7 -> 18.2 ms; four threads: **Firefly 74 -> 82.5 fps, Pi 5 56.4 -> 59.4 fps**. On x86
 the same test in the float counter costs more than it saves, so it is ARM only.
 
+**The coarse rows.** The 32-bit levels hold 1/16 of the coefficients but took 28 % of the counting: about 92 000
+segments of 4-16 values per frame and pass, each a call through a width switch. Their float arithmetic now runs
+inlined in four NEON lanes (the conversions and the multiply round as the scalar code; `scripts/enc-check.sh`: 702
+and 864 cases identical on the Pi 5 and the Firefly). Counting per 1080p frame on one core: Firefly 16.1 -> 13.9
+ms, Pi 5 18.2 -> 15.8 ms; four threads: **Firefly 82.5 -> 87 fps, Pi 5 59.4 -> 62.7 fps**.
+
 **The front end on Mali (`make GPU=cl`, `vc2enc --gpu cl`).** The two 16-bit levels as an OpenCL kernel
 (`lib/vc2_fwd.cl`, `lib/vc2_enc_cl.c`): one work-item per 8 band columns and 16 band rows, horizontal lifting
 per row, the vertical steps in a rolling window, one row pair recomputed above each strip. Bit-exact: all 5.2

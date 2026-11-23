@@ -4,6 +4,9 @@
 #include "vc2_priv.h"
 #include "vc2_enc_gpu.h"
 #include <stdio.h>
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 #include <time.h>
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
 static int n_eval;
@@ -644,6 +647,34 @@ static int quant_row16(const int16_t *c, int w, float r16, int32_t *v)
     }
 }
 
+// The 32-bit (coarse) rows: count_row_w's float arithmetic in four NEON lanes, inlined into the slice loop (these
+// rows are short, 4-16 values, and the calls cost more than the arithmetic). The same numbers: the conversions and
+// the multiply round as the scalar code does.
+static inline __attribute__((always_inline)) int count_row32v(const int32_t *c, int w, float r16, uint32_t *bits, uint32_t *dd)
+{
+#ifdef __aarch64__
+    if (w < 4 || (w & 3)) return 0;
+    const float32x4_t r = vdupq_n_f32(r16);
+    const int32x4_t lim = vdupq_n_s32(255), lim2 = vdupq_n_s32(4096), one = vdupq_n_s32(1);
+    uint32x4_t b = vdupq_n_u32(0), d = vdupq_n_u32(0);
+    for (int x = 0; x < w; x += 4) {
+        int32x4_t n = vshlq_n_s32(vabsq_s32(vld1q_s32(c + x)), 2);
+        int32x4_t u = vcvtq_s32_f32(vmulq_f32(vcvtq_f32_s32(n), r)), v = vshrq_n_s32(u, 4);
+        uint32x4_t ex = vsubq_u32(vshrq_n_u32(vreinterpretq_u32_f32(vcvtq_f32_s32(vaddq_s32(v, one))), 23), vdupq_n_u32(127));
+        uint32x4_t nzm = vtstq_s32(v, v);
+        int32x4_t vv = vminq_s32(v, lim), uu = vminq_s32(u, lim2);
+        b = vaddq_u32(b, vsubq_u32(vaddq_u32(vshlq_n_u32(ex, 1), vdupq_n_u32(1)), nzm));
+        int32x4_t pd = vmulq_s32(vaddq_s32(vshlq_n_s32(vv, 1), one), vsubq_s32(vsubq_s32(uu, vshlq_n_s32(vv, 3)), vdupq_n_s32(4)));
+        d = vaddq_u32(d, vandq_u32(vreinterpretq_u32_s32(pd), nzm));
+    }
+    *bits = vaddvq_u32(b); *dd = vaddvq_u32(d);
+    return 1;
+#else
+    (void)c; (void)w; (void)r16; (void)bits; (void)dd;
+    return 0;
+#endif
+}
+
 // The 16-bit rows' counter: the arithmetic of count_row_w in exact integers, eight lanes of 16 bits (NEON).
 // bits = 2 J + 1 + [v > 0] with J = floor(log2(v + 1)); dd = (2 vv + 1)(uu - 8 vv - 4) for v > 0, where vv = min(v, 255)
 // and uu = min(16 v + f, 4096): for v <= 255 that is (2v + 1)(8v + f - 4), above it the constant 511 * 2052.
@@ -759,7 +790,8 @@ static void count_slice_row(vc2_enc *e, escratch *s, int sy, int qi, uint16_t *b
                         const int32_t *row = p->band[l][o] + (size_t)y * p->g.bw[l];
                         s->rows[n] = (rowref){ row, l, 0, r16 };
                         for (int sx = 0; sx < nx; sx++)
-                            count_row(row + xs[sx], xs[sx + 1] - xs[sx], r16, &s->bits[n * nx + sx], &s->dd[n * nx + sx], &nz);
+                            if (getenv_no16c || !count_row32v(row + xs[sx], xs[sx + 1] - xs[sx], r16, &s->bits[n * nx + sx], &s->dd[n * nx + sx]))
+                                count_row(row + xs[sx], xs[sx + 1] - xs[sx], r16, &s->bits[n * nx + sx], &s->dd[n * nx + sx], &nz);
                     }
                 }
             }
