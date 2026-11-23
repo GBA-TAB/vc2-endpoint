@@ -170,6 +170,16 @@ worst-case picture down to quantiser 0. `VC2_NO16=1` turns it off. 1080p 3 bpp, 
 
 So a Pi 5 now encodes 1080p50 at 3 bpp on its four cores, and the RK3588 has about 25 % headroom.
 
+**The counter in 16-bit lanes (arm64).** For the 16-bit rows the counter computes v = floor(4|c| / qf) and the
+1/16 step floor(64|c| / qf), which equal the float expressions on that range, with per-quantiser multiply-high
+constants (a 17-bit form with a halving add where 16 bits are not enough) in eight NEON lanes. The constants are
+found and checked against every possible input when the encoder starts; quantisers without exact constants (51
+and 54) keep the generic counter, and for the 61 coarsest every value of such a row is 0. The same bytes out in
+123 cases on both boards (three clips including the worst-case picture, fixed q 0-60). It gains less than the
+operation count promised, because the A76 has one vector multiply pipe and each coefficient needs seven:
+counting 23.8 -> 21.7 ms (Pi 5) and 23.5 -> 21.2 ms (Firefly) per frame on one core; four threads: Pi 5
+51-54 -> 56 fps, Firefly 63-64 -> 66.7 fps. `VC2_NO16C=1` turns it off.
+
 ## 3. Decoder
 
 - **Entropy decoding**: a 12-bit lookup yields all coefficients complete within those bits (up to 12 zeros,

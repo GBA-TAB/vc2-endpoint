@@ -33,6 +33,13 @@ typedef struct {
 } eplane;
 
 typedef struct { const void *p; int level, is16; float r16; } rowref; // one band row of a slice row
+// The counter's constants for 16-bit rows, per quantiser index: v = floor(n / qf) = mulhi(n, m) >> s and
+// f = floor(16 r / qf) = mulhi(r << k, m2) >> s2 with r = n - v qf, both checked exhaustively at start-up for every
+// n = 4|c| with |c| <= 12813 (the bound of the 16-bit levels) and every r < qf. mode 0: no such constants, the
+// generic row counter; 1: the vector counter; 2: qf > 51252, every value of such a row is 0.
+typedef struct { uint16_t m, m2, qf; uint8_t s, s2, k, mode, av, af; } cnt16; // av/af: the 17-bit form (see c16_find)
+static const cnt16 c16_off = { 0 };
+static int getenv_no16c = -1; // VC2_NO16C=1: the 16-bit rows through the generic counter
 typedef struct { rowref *rows; uint32_t *bits, *dd; int32_t *tmp, *gather; uint8_t *obuf; } escratch;
 
 struct vc2_enc {
@@ -47,6 +54,7 @@ struct vc2_enc {
     // proven (every band and every sum inside a lifting step of the two finest levels below 32768); else depth + 1
     int l16;
     float r16[VC2_NQ];
+    cnt16 c16[VC2_NQ];
     escratch *scr;
     // rate control
     uint16_t *cb[VC2_NQ];       // per quantiser: component bytes per slice (3 each), allocated on demand
@@ -74,6 +82,38 @@ void vc2_enc_defaults(vc2_enc_cfg *c, int width, int height)
     c->wavelet = VC2_WL_LEGALL5_3; c->depth = 4;
     c->slice_w = 128; c->slice_h = 16;
     c->bpp = 3; c->tail_lambda = 0.2; c->threads = 1;
+}
+
+// Constants for floor(x * mul / qf), x = 0, step, .. <= xmax, with y = x << pre < 65536, in 16-bit lanes:
+//   plain: mulhi(y, m) >> s, i.e. floor(y m / 2^(16+s)), m < 2^16;
+//   17-bit (*a = 1): ((y + mulhi(y, m)) >> 1) >> (s - 1) by a halving add, i.e. floor(y (2^16 + m) / 2^(16+s)), s >= 1.
+// Checked for every x; the first form that holds is taken.
+static int c16_find(uint32_t qf, uint32_t step, uint32_t xmax, uint32_t mul, uint32_t pre, uint16_t *m, uint8_t *s, uint8_t *a)
+{
+    if ((xmax << pre) > 65535) return 0;
+    for (uint32_t add = 0; add < 2; add++)
+        for (uint32_t ss = add; ss < 16; ss++) {
+            uint64_t t = ((uint64_t)mul << (16 + ss)) / qf >> pre;
+            for (uint64_t mm = t; mm <= t + 2; mm++) {
+                uint64_t mf = mm; // the full multiplier, 2^16 + m in the 17-bit form
+                if (add ? (mf < 65536 || mf > 131071) : (mf < 1 || mf > 65535)) continue;
+                int ok = 1;
+                for (uint32_t x = 0; x <= xmax && ok; x += step)
+                    ok = (uint32_t)(((uint64_t)(x << pre) * mf) >> (16 + ss)) == (uint32_t)((uint64_t)x * mul / qf);
+                if (ok) { *m = (uint16_t)(mf & 0xffff); *s = (uint8_t)ss; *a = (uint8_t)add; return 1; }
+            }
+        }
+    return 0;
+}
+static void c16_init(cnt16 *t, uint32_t qf, float r16)
+{
+    memset(t, 0, sizeof *t);
+    // the float counter must equal the integer floors on the whole range, else stay with it
+    for (uint32_t c = 0; c <= 12813; c++)
+        if ((uint32_t)(int32_t)((float)(c << 2) * r16) != (uint32_t)((uint64_t)64 * c / qf)) return;
+    if (qf > 51252) { t->mode = 2; return; }
+    t->qf = (uint16_t)qf; t->k = 16 * qf <= 65536 ? 4 : 0;
+    if (c16_find(qf, 4, 51252, 1, 0, &t->m, &t->s, &t->av) && c16_find(qf, 1, qf - 1, 16, t->k, &t->m2, &t->s2, &t->af)) t->mode = 1;
 }
 
 vc2_enc *vc2_enc_new(const vc2_enc_cfg *c)
@@ -137,6 +177,8 @@ vc2_enc *vc2_enc_new(const vc2_enc_cfg *c)
         e->scr[i].obuf = malloc(4 + 3 * 65536 + 64);
     }
     for (int q = 0; q < VC2_NQ; q++) e->r16[q] = (float)(16.0 / vc2_qf[q] * (1.0 + 1.0 / (1 << 20)));
+    for (int q = 0; q < VC2_NQ; q++) c16_init(&e->c16[q], vc2_qf[q], e->r16[q]);
+    if (getenv_no16c < 0) getenv_no16c = getenv("VC2_NO16C") != 0;
     e->sq = malloc(e->nslices);
     e->soff = malloc((e->nslices + 1) * sizeof *e->soff);
     e->last_q = 24; e->scaler = 1;
@@ -414,6 +456,54 @@ static int quant_row16(const int16_t *c, int w, float r16, int32_t *v)
     }
 }
 
+// The 16-bit rows' counter: the arithmetic of count_row_w in exact integers, eight lanes of 16 bits (NEON).
+// bits = 2 J + 1 + [v > 0] with J = floor(log2(v + 1)); dd = (2 vv + 1)(uu - 8 vv - 4) for v > 0, where vv = min(v, 255)
+// and uu = min(16 v + f, 4096): for v <= 255 that is (2v + 1)(8v + f - 4), above it the constant 511 * 2052.
+#ifdef __aarch64__
+#include <arm_neon.h>
+static inline uint16x8_t mulhi16(uint16x8_t a, uint16x8_t b)
+{
+    return vuzp2q_u16(vreinterpretq_u16_u32(vmull_u16(vget_low_u16(a), vget_low_u16(b))), vreinterpretq_u16_u32(vmull_high_u16(a, b)));
+}
+#endif
+static inline __attribute__((always_inline)) void count_row16v(const int16_t *c, int w, const cnt16 *t, float r16, uint32_t *bits, uint32_t *dd, int *nz)
+{
+    if (t->mode == 2) { *bits = (uint32_t)w; *dd = 0; *nz = 0; return; }
+#ifdef __aarch64__
+    if (t->mode == 1 && w >= 8) {
+        const uint16x8_t m = vdupq_n_u16(t->m), m2 = vdupq_n_u16(t->m2), qf = vdupq_n_u16(t->qf), lim = vdupq_n_u16(255);
+        const int16x8_t sh = vdupq_n_s16(-(int16_t)(t->s - t->av)), sh2 = vdupq_n_s16(-(int16_t)(t->s2 - t->af)), k = vdupq_n_s16((int16_t)t->k);
+        const int av = t->av, af = t->af;
+        uint16x8_t accb = vdupq_n_u16(0), any = vdupq_n_u16(0);
+        uint32x4_t accd = vdupq_n_u32(0);
+        int x = 0;
+        for (; x + 8 <= w; x += 8) {
+            uint16x8_t n = vshlq_n_u16(vreinterpretq_u16_s16(vabsq_s16(vld1q_s16(c + x))), 2);
+            uint16x8_t hv = mulhi16(n, m);
+            uint16x8_t v = vshlq_u16(av ? vhaddq_u16(n, hv) : hv, sh);
+            uint16x8_t r = vmlsq_u16(n, v, qf), rk = vshlq_u16(r, k), hf = mulhi16(rk, m2);
+            uint16x8_t f = vshlq_u16(af ? vhaddq_u16(rk, hf) : hf, sh2);
+            uint16x8_t nzm = vtstq_u16(v, v);
+            uint16x8_t j = vsubq_u16(vdupq_n_u16(15), vclzq_u16(vaddq_u16(v, vdupq_n_u16(1))));
+            accb = vaddq_u16(accb, vsubq_u16(vaddq_u16(vshlq_n_u16(j, 1), vdupq_n_u16(1)), nzm));
+            any = vorrq_u16(any, v);
+            uint16x8_t vv = vminq_u16(v, lim);
+            int16x8_t a = vreinterpretq_s16_u16(vandq_u16(vaddq_u16(vshlq_n_u16(vv, 1), vdupq_n_u16(1)), nzm));
+            uint16x8_t bt = vsubq_u16(vaddq_u16(vshlq_n_u16(vv, 3), f), vdupq_n_u16(4));
+            bt = vbslq_u16(vcgtq_u16(v, lim), vdupq_n_u16(2052), bt);
+            int16x8_t b = vreinterpretq_s16_u16(bt);
+            accd = vreinterpretq_u32_s32(vmlal_s16(vreinterpretq_s32_u32(accd), vget_low_s16(a), vget_low_s16(b)));
+            accd = vreinterpretq_u32_s32(vmlal_high_s16(vreinterpretq_s32_u32(accd), a, b));
+        }
+        uint32_t bsum = vaddlvq_u16(accb), dsum = vaddvq_u32(accd), anys = vmaxvq_u16(any);
+        if (x < w) { uint32_t b2, d2; int nz2; count_row16(c + x, w - x, r16, &b2, &d2, &nz2); bsum += b2; dsum += d2; anys |= (uint32_t)nz2; }
+        *bits = bsum; *dd = dsum; *nz = anys != 0;
+        return;
+    }
+#endif
+    count_row16(c, w, r16, bits, dd, nz);
+}
+
 // Sizes of the slices of one slice row at quantiser index qi: bytes per component, and the rows kept (coding
 // order). Works band row by band row, so the coefficient memory is read in order.
 static void count_slice_row(vc2_enc *e, escratch *s, int sy, int qi, uint16_t *bytes, uint16_t *cuts)
@@ -427,6 +517,7 @@ static void count_slice_row(vc2_enc *e, escratch *s, int sy, int qi, uint16_t *b
             for (int o = l ? 1 : 0; o < (l ? 4 : 1); o++) {
                 int q = qi - e->qm[l][o];
                 float r16 = e->r16[q < 0 ? 0 : q];
+                const cnt16 *ct = getenv_no16c ? &c16_off : &e->c16[q < 0 ? 0 : q];
                 for (int y = p->ys[l][sy]; y < p->ys[l][sy + 1]; y++, n++) {
                     const int *xs = p->xs[l];
                     int nz;
@@ -434,7 +525,7 @@ static void count_slice_row(vc2_enc *e, escratch *s, int sy, int qi, uint16_t *b
                         const int16_t *row = p->band16[l][o] + (size_t)y * p->g.bw[l];
                         s->rows[n] = (rowref){ row, l, 1, r16 };
                         for (int sx = 0; sx < nx; sx++)
-                            count_row16(row + xs[sx], xs[sx + 1] - xs[sx], r16, &s->bits[n * nx + sx], &s->dd[n * nx + sx], &nz);
+                            count_row16v(row + xs[sx], xs[sx + 1] - xs[sx], ct, r16, &s->bits[n * nx + sx], &s->dd[n * nx + sx], &nz);
                     } else {
                         const int32_t *row = p->band[l][o] + (size_t)y * p->g.bw[l];
                         s->rows[n] = (rowref){ row, l, 0, r16 };

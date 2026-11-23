@@ -56,7 +56,9 @@ that.
    The default stays.
 2. **CPU, 16-bit storage for the finest levels.** Done 2026-11-23 (README section 2): Pi 5 1080p50 on four
    cores (39.5 -> 55 fps), Firefly 55.8 -> 65.3 fps, byte-identical. The counting still widens to 32 bits after
-   the load; 16-bit counting lanes are the next step there. The proven bounds (FPGA.md section 6): the finest level's
+   the load; 16-bit counting lanes are the next step there. Done the same day: exact (constants checked at
+   start-up), about 10 % off the counting (one vector multiply pipe on the A76, seven multiplies per
+   coefficient); Firefly 66.7 fps with four threads. The proven bounds (FPGA.md section 6): the finest level's
    bands fit 13 bits, the next 15-16; only the two coarsest need 17. Storing levels 3-4 (three quarters of the
    samples) in 16 bits halves the wavelet's and the counter's memory traffic and doubles the NEON lanes.
 3. **Mali, the encoder's front end (OpenCL, libmali).** Forward wavelet and per-slice counting on the GPU:
