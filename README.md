@@ -518,9 +518,9 @@ setting of the board, not of this code.
     # over a network: the receiver binds its address (or 0.0.0.0), the sender needs --network for a unicast
     # destination outside loopback; multicast, broadcast and 172.30.3.0/24 are refused
     sudo taskset -c 5 build/vc2recv --bind 0.0.0.0 --port 5872 --frames 500 &
-    build/vc2send --network --dst 192.168.98.162 --port 5872 --frames 500 rtp.vc2
+    build/vc2send --network --dst 192.0.2.10 --port 5872 --frames 500 rtp.vc2
     # live: encode a looped source in real time and send it
-    build/vc2send --encode 1920x1080 --threads 4 --bpp 3 --fps 50 --spread 0.5 --network --dst 192.168.98.116 in.yuv
+    build/vc2send --encode 1920x1080 --threads 4 --bpp 3 --fps 50 --spread 0.5 --network --dst 192.0.2.11 in.yuv
     build/vc2send --sdp rtp.vc2
 
 ## 8. Open
