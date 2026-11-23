@@ -193,6 +193,22 @@ CPU. Per 1080p frame at 3 bpp: CPU 47.3 -> 41.9 ms (four threads), one thread 44
 threads the frame rate stays the same (66-67 fps), since the CPU waits for the GPU. Component widths must be
 multiples of 64.
 
+The rate control's counting of those bands runs on the GPU as well (`count16` in `lib/vc2_fwd.cl`: the C
+counter's float arithmetic, which OpenCL rounds the same way, eight values per step; all 16-bit bands lie in one
+buffer, so one launch per quantiser counts the frame, about 1 ms on the Mali-G610). The CPU keeps the coarse
+bands, the truncation decisions and the writer. The same bytes out as the CPU path in 141 cases (with
+`--rc-rows 1`, `--max-slice`, fixed q, UHD, the worst-case picture). Firefly, 3 bpp:
+
+| | CPU only | GPU wavelet + counting |
+|---|---:|---:|
+| 1080p, 1 thread | 22.0 fps | 33.0 fps |
+| 1080p, 2 threads | 42.3 fps | **54.3 fps** |
+| 1080p, 4 threads | 65.8 fps | 68.6 fps |
+| 1080p, CPU per frame | 46-48 ms | 25-26 ms |
+| UHD, 4 threads | 15.7 fps (218 ms CPU per frame) | 19.3 fps (106 ms) |
+
+So 1080p50 takes two A76 cores and the Mali. `VC2_NO_GPU_COUNT=1` keeps the counting on the CPU.
+
 ## 3. Decoder
 
 - **Entropy decoding**: a 12-bit lookup yields all coefficients complete within those bits (up to 12 zeros,

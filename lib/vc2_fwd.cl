@@ -49,3 +49,40 @@ __kernel void fwd53(__global const short *in, int istride, int w, int h, int rb,
         }
     }
 }
+
+// The rate control's counting for the 16-bit bands (lib/vc2_enc.c count_row_w, the same float arithmetic:
+// OpenCL rounds a single multiply correctly, and nothing here can be contracted): per band row and slice, the
+// bits of the coefficients at the band's quantiser and the truncation cost. desc[i] = { offset in shorts, band
+// width, band rows, first output index }; one work-item per (band row, slice), dimension 1 = the band.
+__kernel void count16(__global const short *bands, __global const int4 *desc, __global const float *r16, int nx,
+                      __global uint2 *out)
+{
+    const int4 d = desc[get_global_id(1)];
+    const int seg = get_global_id(0), y = seg / nx, sx = seg - y * nx;
+    if (y >= d.z) return;
+    const float r = r16[get_global_id(1)];
+    const int x0 = (int)((long)d.y * sx / nx), x1 = (int)((long)d.y * (sx + 1) / nx);
+    __global const short *c = bands + d.x + (size_t)y * d.y;
+    uint b = 0, dd = 0;
+    int x = x0;
+    if (!(x0 & 7))
+        for (; x + 8 <= x1; x += 8) { // eight at a time, the same arithmetic per lane
+            int8 n = convert_int8(abs(vload8(0, c + x))) << 2;
+            int8 u = convert_int8_rtz(convert_float8(n) * r), v = u >> 4;
+            uint8 ex = (as_uint8(convert_float8(v + 1)) >> 23) - 127;
+            int8 vv = min(v, 255), uu = min(u, 4096);
+            uint8 bb = 2 * ex + 1 + as_uint8(-(v != 0));
+            uint8 d8 = select((uint8)0, as_uint8((2 * vv + 1) * (uu - 8 * vv - 4)), v != 0);
+            b += bb.s0 + bb.s1 + bb.s2 + bb.s3 + bb.s4 + bb.s5 + bb.s6 + bb.s7;
+            dd += d8.s0 + d8.s1 + d8.s2 + d8.s3 + d8.s4 + d8.s5 + d8.s6 + d8.s7;
+        }
+    for (; x < x1; x++) {
+        int n = abs((int)c[x]) << 2;
+        int u = convert_int_rtz((float)n * r), v = u >> 4;
+        uint ex = (as_uint((float)(v + 1)) >> 23) - 127;
+        int vv = min(v, 255), uu = min(u, 4096);
+        b += 2 * ex + 1 + (v != 0);
+        dd += v ? (uint)((2 * vv + 1) * (uu - 8 * vv - 4)) : 0;
+    }
+    out[d.w + seg] = (uint2)(b, dd);
+}

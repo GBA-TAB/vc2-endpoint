@@ -1,6 +1,7 @@
-// The encoder's GPU front end in OpenCL (see vc2_enc_gpu.h): the kernel of vc2_fwd.cl on buffers the driver
+// The encoder's GPU front end in OpenCL (see vc2_enc_gpu.h): the kernels of vc2_fwd.cl on buffers the driver
 // allocates (CL_MEM_ALLOC_HOST_PTR), mapped for the CPU around each frame: the input for writing before the
-// launch, the bands for reading after it (the counter and the writer read them in place).
+// launch, the bands for reading after it (the writer reads them in place). All 24 bands of the two levels lie in
+// one buffer (sub-buffers for the wavelet kernel), so one launch counts all of them for a quantiser.
 #define CL_TARGET_OPENCL_VERSION 300
 #include "vc2_enc_gpu.h"
 #include <CL/cl.h>
@@ -11,17 +12,41 @@
 __asm__(".pushsection .rodata\n.global vc2_fwd_cl_src\nvc2_fwd_cl_src:\n.incbin \"" VC2_FWD_CL "\"\n.byte 0\n.popsection\n");
 extern const char vc2_fwd_cl_src[];
 
-#define RB 16 // band rows per work-item (best on the Mali-G610: 8 1.56 ms, 16 1.39 ms, 32 2.36 ms per 1080p frame)
+#define RB 16    // band rows per work-item of the wavelet (Mali-G610: 8 1.56 ms, 16 1.39 ms, 32 2.36 ms per 1080p frame)
+#define NSLOT 8  // counting results kept per frame (the rate control asks for a few quantisers)
+#define ALIGN 4096
+
+typedef struct { int q; cl_mem mem; uint32_t *map; } slot;
 
 struct vc2_encgpu {
     cl_context ctx;
     cl_command_queue q;
     cl_program prog;
-    cl_kernel k;
-    cl_mem in[3], b4[3][4], b3[3][4];
-    int16_t *min[3], *m4[3][4], *m3[3][4];
-    int pw[3], ph, mapped;
+    cl_kernel k, kc;
+    cl_mem in[3], bands, sub4[3][4], sub3[3][4], desc, r16;
+    int16_t *min[3], *mbands;
+    size_t off4[3][4], off3[3][4], nbands; // in shorts
+    int pw[3], ph, nx, mapped, nseg_max;
+    int base[3][5][4];                     // first counting output index of each 16-bit band
+    size_t nout;
+    slot sl[NSLOT];
+    int nsl;
+    double ms;
 };
+
+static void unmap_slots(vc2_encgpu *g)
+{
+    for (int i = 0; i < g->nsl; i++) if (g->sl[i].map) { clEnqueueUnmapMemObject(g->q, g->sl[i].mem, g->sl[i].map, 0, 0, 0); g->sl[i].map = 0; }
+    for (int i = 0; i < NSLOT; i++) g->sl[i].q = -1;
+    g->nsl = 0;
+}
+
+void vc2_encgpu_release(vc2_encgpu *g)
+{
+    if (!g) return;
+    unmap_slots(g);
+    if (g->mapped) { clEnqueueUnmapMemObject(g->q, g->bands, g->mbands, 0, 0, 0); g->mapped = 0; }
+}
 
 void vc2_encgpu_free(vc2_encgpu *g)
 {
@@ -30,21 +55,33 @@ void vc2_encgpu_free(vc2_encgpu *g)
     for (int c = 0; c < 3; c++) {
         if (g->min[c]) clEnqueueUnmapMemObject(g->q, g->in[c], g->min[c], 0, 0, 0);
         if (g->in[c]) clReleaseMemObject(g->in[c]);
-        for (int b = 0; b < 4; b++) { if (g->b4[c][b]) clReleaseMemObject(g->b4[c][b]); if (g->b3[c][b]) clReleaseMemObject(g->b3[c][b]); }
+        for (int b = 0; b < 4; b++) { if (g->sub4[c][b]) clReleaseMemObject(g->sub4[c][b]); if (g->sub3[c][b]) clReleaseMemObject(g->sub3[c][b]); }
     }
+    for (int i = 0; i < NSLOT; i++) if (g->sl[i].mem) clReleaseMemObject(g->sl[i].mem);
+    if (g->bands) clReleaseMemObject(g->bands);
+    if (g->desc) clReleaseMemObject(g->desc);
+    if (g->r16) clReleaseMemObject(g->r16);
     if (g->q) clFinish(g->q);
     if (g->k) clReleaseKernel(g->k);
+    if (g->kc) clReleaseKernel(g->kc);
     if (g->prog) clReleaseProgram(g->prog);
     if (g->q) clReleaseCommandQueue(g->q);
     if (g->ctx) clReleaseContext(g->ctx);
     free(g);
 }
 
-vc2_encgpu *vc2_encgpu_new(const int pw[3], int ph)
+static cl_mem sub(vc2_encgpu *g, size_t off, size_t n, cl_int *err)
+{
+    cl_buffer_region r = { off * 2, n * 2 + 64 };
+    return clCreateSubBuffer(g->bands, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &r, err);
+}
+
+vc2_encgpu *vc2_encgpu_new(const int pw[3], int ph, int nx)
 {
     for (int c = 0; c < 3; c++) if (pw[c] % 64 || pw[c] < 64) return 0;
-    if (ph % 16) return 0;
+    if (ph % 16 || nx < 1) return 0;
     vc2_encgpu *g = calloc(1, sizeof *g);
+    for (int i = 0; i < NSLOT; i++) g->sl[i].q = -1;
     cl_platform_id pl; cl_device_id dev; cl_int err;
     if (clGetPlatformIDs(1, &pl, 0) || clGetDeviceIDs(pl, CL_DEVICE_TYPE_GPU, 1, &dev, 0)) goto fail;
     g->ctx = clCreateContext(0, 1, &dev, 0, 0, &err);
@@ -61,16 +98,47 @@ vc2_encgpu *vc2_encgpu_new(const int pw[3], int ph)
     }
     g->k = clCreateKernel(g->prog, "fwd53", &err);
     if (err) goto fail;
-    g->ph = ph;
+    g->kc = clCreateKernel(g->prog, "count16", &err);
+    if (err) goto fail;
+    g->ph = ph; g->nx = nx;
+    // the band layout: level 4 (index 4) and level 3 of each component, every band at an aligned offset
+    size_t off = 0;
+    cl_int desc[18][4];
+    int nd = 0;
+    g->nout = 0;
     for (int c = 0; c < 3; c++) {
-        size_t w4 = pw[c] / 2, h4 = ph / 2, n4 = w4 * h4, n3 = n4 / 4;
         g->pw[c] = pw[c];
+        size_t n4 = (size_t)(pw[c] / 2) * (ph / 2), n3 = n4 / 4;
+        for (int b = 0; b < 4; b++) {
+            g->off4[c][b] = off; off += (n4 + 64 + ALIGN / 2 - 1) / (ALIGN / 2) * (ALIGN / 2);
+            g->off3[c][b] = off; off += (n3 + 64 + ALIGN / 2 - 1) / (ALIGN / 2) * (ALIGN / 2);
+        }
+        for (int lv = 4; lv >= 3; lv--)
+            for (int b = 1; b < 4; b++) {
+                int bw = lv == 4 ? pw[c] / 2 : pw[c] / 4, bh = lv == 4 ? ph / 2 : ph / 4;
+                desc[nd][0] = (cl_int)(lv == 4 ? g->off4[c][b] : g->off3[c][b]);
+                desc[nd][1] = bw; desc[nd][2] = bh; desc[nd][3] = (cl_int)g->nout;
+                g->base[c][lv][b] = (int)g->nout;
+                g->nout += (size_t)bh * nx;
+                if (bh * nx > g->nseg_max) g->nseg_max = bh * nx;
+                nd++;
+            }
+    }
+    g->nbands = off;
+    g->bands = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, off * 2, 0, &err);
+    if (err) goto fail;
+    g->desc = clCreateBuffer(g->ctx, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof desc, desc, &err);
+    if (err) goto fail;
+    g->r16 = clCreateBuffer(g->ctx, CL_MEM_READ_ONLY, 18 * sizeof(float), 0, &err);
+    if (err) goto fail;
+    for (int c = 0; c < 3; c++) {
+        size_t n4 = (size_t)(pw[c] / 2) * (ph / 2), n3 = n4 / 4;
         g->in[c] = clCreateBuffer(g->ctx, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, (size_t)pw[c] * ph * 2, 0, &err);
         if (err) goto fail;
         for (int b = 0; b < 4; b++) {
-            g->b4[c][b] = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, n4 * 2 + 64, 0, &err);
+            g->sub4[c][b] = sub(g, g->off4[c][b], n4, &err);
             if (err) goto fail;
-            g->b3[c][b] = clCreateBuffer(g->ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, n3 * 2 + 64, 0, &err);
+            g->sub3[c][b] = sub(g, g->off3[c][b], n3, &err);
             if (err) goto fail;
         }
     }
@@ -87,15 +155,13 @@ int16_t *vc2_encgpu_input(vc2_encgpu *g, int c)
     return g->min[c];
 }
 
-void vc2_encgpu_release(vc2_encgpu *g)
+static double ev_ms(cl_event e)
 {
-    if (!g || !g->mapped) return;
-    for (int c = 0; c < 3; c++)
-        for (int b = 0; b < 4; b++) {
-            clEnqueueUnmapMemObject(g->q, g->b4[c][b], g->m4[c][b], 0, 0, 0);
-            clEnqueueUnmapMemObject(g->q, g->b3[c][b], g->m3[c][b], 0, 0, 0);
-        }
-    g->mapped = 0;
+    cl_ulong a = 0, b = 0;
+    clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_START, 8, &a, 0);
+    clGetEventProfilingInfo(e, CL_PROFILING_COMMAND_END, 8, &b, 0);
+    clReleaseEvent(e);
+    return (double)(b - a) * 1e-6;
 }
 
 int vc2_encgpu_run(vc2_encgpu *g, int16_t *b4[3][4], int16_t *b3[3][4], double *gpu_ms)
@@ -108,7 +174,7 @@ int vc2_encgpu_run(vc2_encgpu *g, int16_t *b4[3][4], int16_t *b3[3][4], double *
     for (int lv = 0; lv < 2; lv++)
         for (int c = 0; c < 3; c++) {
             cl_int w = lv ? g->pw[c] / 4 : g->pw[c] / 2, h = lv ? g->ph / 4 : g->ph / 2, is = 2 * w;
-            cl_mem in = lv ? g->b4[c][0] : g->in[c], *o = lv ? g->b3[c] : g->b4[c];
+            cl_mem in = lv ? g->sub4[c][0] : g->in[c], *o = lv ? g->sub3[c] : g->sub4[c];
             err |= clSetKernelArg(g->k, 0, sizeof in, &in);
             err |= clSetKernelArg(g->k, 1, 4, &is);
             err |= clSetKernelArg(g->k, 2, 4, &w);
@@ -119,23 +185,46 @@ int vc2_encgpu_run(vc2_encgpu *g, int16_t *b4[3][4], int16_t *b3[3][4], double *
             err |= clEnqueueNDRangeKernel(g->q, g->k, 2, 0, gs, 0, 0, 0, &ev[lv * 3 + c]);
             if (err) return -1;
         }
-    for (int c = 0; c < 3 && !err; c++)
-        for (int b = 0; b < 4 && !err; b++) {
-            size_t n4 = (size_t)(g->pw[c] / 2) * (g->ph / 2);
-            g->m4[c][b] = clEnqueueMapBuffer(g->q, g->b4[c][b], CL_FALSE, CL_MAP_READ, 0, n4 * 2, 0, 0, 0, &err);
-            if (!err) g->m3[c][b] = clEnqueueMapBuffer(g->q, g->b3[c][b], CL_FALSE, CL_MAP_READ, 0, n4 / 2, 0, 0, 0, &err);
-        }
+    g->mbands = clEnqueueMapBuffer(g->q, g->bands, CL_FALSE, CL_MAP_READ, 0, g->nbands * 2, 0, 0, 0, &err);
     if (err || clFinish(g->q)) return -1;
     g->mapped = 1;
     double t = 0;
-    for (int i = 0; i < 6; i++) {
-        cl_ulong a = 0, b = 0;
-        clGetEventProfilingInfo(ev[i], CL_PROFILING_COMMAND_START, 8, &a, 0);
-        clGetEventProfilingInfo(ev[i], CL_PROFILING_COMMAND_END, 8, &b, 0);
-        t += (double)(b - a) * 1e-6;
-        clReleaseEvent(ev[i]);
-    }
+    for (int i = 0; i < 6; i++) t += ev_ms(ev[i]);
+    g->ms = t;
     if (gpu_ms) *gpu_ms = t;
-    for (int c = 0; c < 3; c++) for (int b = 0; b < 4; b++) { b4[c][b] = g->m4[c][b]; b3[c][b] = g->m3[c][b]; }
+    for (int c = 0; c < 3; c++) for (int b = 0; b < 4; b++) { b4[c][b] = g->mbands + g->off4[c][b]; b3[c][b] = g->mbands + g->off3[c][b]; }
     return 0;
+}
+
+int vc2_encgpu_base(const vc2_encgpu *g, int c, int level, int o) { return g->base[c][level][o]; }
+
+const uint32_t *vc2_encgpu_count(vc2_encgpu *g, int q, const float r16[18], double *gpu_ms)
+{
+    for (int i = 0; i < g->nsl; i++) if (g->sl[i].q == q) return g->sl[i].map;
+    if (g->nsl == NSLOT) return 0;
+    slot *s = &g->sl[g->nsl];
+    cl_int err = 0;
+    if (!s->mem) {
+        s->mem = clCreateBuffer(g->ctx, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, g->nout * 8, 0, &err);
+        if (err) { s->mem = 0; return 0; }
+    }
+    cl_event ev;
+    const cl_int nx = g->nx;
+    err |= clEnqueueWriteBuffer(g->q, g->r16, CL_FALSE, 0, 18 * sizeof(float), r16, 0, 0, 0);
+    err |= clSetKernelArg(g->kc, 0, sizeof g->bands, &g->bands);
+    err |= clSetKernelArg(g->kc, 1, sizeof g->desc, &g->desc);
+    err |= clSetKernelArg(g->kc, 2, sizeof g->r16, &g->r16);
+    err |= clSetKernelArg(g->kc, 3, 4, &nx);
+    err |= clSetKernelArg(g->kc, 4, sizeof s->mem, &s->mem);
+    size_t gs[2] = { (size_t)(g->nseg_max + 63) / 64 * 64, 18 };
+    err |= clEnqueueNDRangeKernel(g->q, g->kc, 2, 0, gs, 0, 0, 0, &ev);
+    if (err) return 0;
+    s->map = clEnqueueMapBuffer(g->q, s->mem, CL_TRUE, CL_MAP_READ, 0, g->nout * 8, 0, 0, 0, &err);
+    if (err) { s->map = 0; return 0; }
+    double t = ev_ms(ev);
+    g->ms += t;
+    if (gpu_ms) *gpu_ms += t;
+    s->q = q;
+    g->nsl++;
+    return s->map;
 }

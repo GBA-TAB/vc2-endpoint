@@ -63,8 +63,10 @@ that.
    samples) in 16 bits halves the wavelet's and the counter's memory traffic and doubles the NEON lanes.
 3. **Mali, the encoder's front end (OpenCL, libmali).** First part done 2026-11-23: the two 16-bit levels on the
    GPU, bit-exact, 1.4-1.9 ms per 1080p frame on the Mali-G610 against about 8 ms on one A76; the encoder's CPU
-   time falls by 5-6 ms per frame, the frame rate not yet (the CPU waits for the GPU). Next: run the GPU one
-   frame ahead (double buffers), then the counting on the GPU (21 ms of CPU per frame). Forward wavelet and per-slice counting on the GPU:
+   time falls by 5-6 ms per frame, the frame rate not yet (the CPU waits for the GPU). Then the counting on the
+   GPU, the same day: CPU per 1080p frame 47 -> 26 ms, 1080p50 on two A76 cores and the Mali (54 fps), UHD
+   15.7 -> 19.3 fps on four, byte-identical. Open: running the GPU one frame ahead (hides 4 ms of GPU per 1080p
+   frame, 15 at UHD, at the cost of one frame of encoder latency), coalesced counting loads. Forward wavelet and per-slice counting on the GPU:
    - the input planes from the dma-heap (a capture or decoder buffer can be imported as a dma-buf, no copy);
    - the wavelet as the decoder's kernel in reverse (blocks of band rows, one launch per band of rows for all
      components);

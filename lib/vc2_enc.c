@@ -31,6 +31,7 @@ typedef struct {
     // LL between two 16-bit levels; the last 16-bit level's LL goes to ll[] in 32 bits
     int16_t *img16, *band16[VC2_MAX_DEPTH + 1][4], *ll16[VC2_MAX_DEPTH + 1];
     int16_t *own16[VC2_MAX_DEPTH + 1][4]; // band16 as allocated (with the GPU front end band16 points into its maps)
+    const int16_t *gll;                   // the GPU's LL of level 3 (this frame)
     int *xs[VC2_MAX_DEPTH + 1], *ys[VC2_MAX_DEPTH + 1];
 } eplane;
 
@@ -42,6 +43,7 @@ typedef struct { const void *p; int level, is16; float r16; } rowref; // one ban
 typedef struct { uint16_t m, m2, qf; uint8_t s, s2, k, mode, av, af; } cnt16; // av/af: the 17-bit form (see c16_find)
 static const cnt16 c16_off = { 0 };
 static int getenv_no16c = -1; // VC2_NO16C=1: the 16-bit rows through the generic counter
+static int getenv_nogc;       // VC2_NO_GPU_COUNT=1: with the GPU front end, count on the CPU
 typedef struct { rowref *rows; uint32_t *bits, *dd; int32_t *tmp, *gather; uint8_t *obuf; } escratch;
 
 struct vc2_enc {
@@ -57,6 +59,8 @@ struct vc2_enc {
     int l16;
     vc2_encgpu *gpu;            // the GPU front end, when set (vc2_enc_set_gpu)
     double gpu_ms;
+    int gpu_frame;              // this frame's 16-bit bands came from the GPU
+    const uint32_t *gcount;     // the GPU's counts for the quantiser being evaluated, or 0
     float r16[VC2_NQ];
     cnt16 c16[VC2_NQ];
     escratch *scr;
@@ -183,6 +187,7 @@ vc2_enc *vc2_enc_new(const vc2_enc_cfg *c)
     for (int q = 0; q < VC2_NQ; q++) e->r16[q] = (float)(16.0 / vc2_qf[q] * (1.0 + 1.0 / (1 << 20)));
     for (int q = 0; q < VC2_NQ; q++) c16_init(&e->c16[q], vc2_qf[q], e->r16[q]);
     if (getenv_no16c < 0) getenv_no16c = getenv("VC2_NO16C") != 0;
+    getenv_nogc = getenv("VC2_NO_GPU_COUNT") != 0;
     e->sq = malloc(e->nslices);
     e->soff = malloc((e->nslices + 1) * sizeof *e->soff);
     e->last_q = 24; e->scaler = 1;
@@ -217,7 +222,7 @@ int vc2_enc_set_gpu(vc2_enc *e, int backend)
     if (backend != VC2_GPU_OPENCL || e->l16 != 3 || e->c.depth != 4) return -1; // the kernel is LeGall 5,3, 16-bit
     int pw[3] = { e->pl[0].g.pw, e->pl[1].g.pw, e->pl[2].g.pw };
     if (e->pl[1].g.ph != e->pl[0].g.ph) return -1; // 4:2:2 / 4:4:4 only
-    e->gpu = vc2_encgpu_new(pw, e->pl[0].g.ph);
+    e->gpu = vc2_encgpu_new(pw, e->pl[0].g.ph, e->nx);
     return e->gpu ? 0 : -1;
 }
 double vc2_enc_gpu_ms(const vc2_enc *e) { return e->gpu ? e->gpu_ms : -1; }
@@ -352,6 +357,7 @@ static void gpu_coarse_job(void *arg, int job, int thread)
 {
     vc2_enc *e = arg;
     eplane *p = &e->pl[job];
+    for (size_t i = 0, n = (size_t)p->g.bw[3] * p->g.bh[3]; i < n; i++) p->ll[2][i] = p->gll[i]; // the GPU's last LL, widened
     for (int l = e->l16 - 1; l >= 1; l--) {
         const int32_t *in = p->ll[l];
         int32_t *bands[4] = { l == 1 ? p->band[0][0] : p->ll[l - 1], p->band[l][1], p->band[l][2], p->band[l][3] };
@@ -367,7 +373,7 @@ static int gpu_wavelet(vc2_enc *e)
     for (int c = 0; c < 3; c++) {
         eplane *p = &e->pl[c];
         for (int o = 1; o < 4; o++) { p->band16[4][o] = b4[c][o]; p->band16[3][o] = b3[c][o]; }
-        for (size_t i = 0, n = (size_t)p->g.bw[3] * p->g.bh[3]; i < n; i++) p->ll[2][i] = b3[c][0][i];
+        p->gll = b3[c][0];
     }
     vc2_pool_run(e->pool, gpu_coarse_job, e, 3);
     return 0;
@@ -582,8 +588,12 @@ static void count_slice_row(vc2_enc *e, escratch *s, int sy, int qi, uint16_t *b
                     if (p->band16[l][o]) {
                         const int16_t *row = p->band16[l][o] + (size_t)y * p->g.bw[l];
                         s->rows[n] = (rowref){ row, l, 1, r16 };
-                        for (int sx = 0; sx < nx; sx++)
-                            count_row16v(row + xs[sx], xs[sx + 1] - xs[sx], ct, r16, &s->bits[n * nx + sx], &s->dd[n * nx + sx], &nz);
+                        if (e->gcount) {
+                            const uint32_t *gc = e->gcount + 2 * ((size_t)vc2_encgpu_base(e->gpu, c, l, o) + (size_t)y * nx);
+                            for (int sx = 0; sx < nx; sx++) { s->bits[n * nx + sx] = gc[2 * sx]; s->dd[n * nx + sx] = gc[2 * sx + 1]; }
+                        } else
+                            for (int sx = 0; sx < nx; sx++)
+                                count_row16v(row + xs[sx], xs[sx + 1] - xs[sx], ct, r16, &s->bits[n * nx + sx], &s->dd[n * nx + sx], &nz);
                     } else {
                         const int32_t *row = p->band[l][o] + (size_t)y * p->g.bw[l];
                         s->rows[n] = (rowref){ row, l, 0, r16 };
@@ -634,6 +644,17 @@ static void count_job(void *arg, int job, int thread)
 
 static void eval_q(vc2_enc *e, int q, int r0, int r1, const int *rows, int nrows)
 {
+    // the 16-bit bands' counts from the GPU when this frame's bands are there and the evaluation is not a few
+    // single slice rows (the slice-size cap's corrections), for which the CPU is quicker than a launch
+    e->gcount = 0;
+    if (e->gpu_frame && !getenv_nogc && (rows ? nrows : r1 - r0) * 8 >= e->ny) {
+        float r[18];
+        int i = 0;
+        for (int c = 0; c < 3; c++)
+            for (int l = 4; l >= 3; l--)
+                for (int o = 1; o < 4; o++) { int qq = q - e->qm[l][o]; r[i++] = e->r16[qq < 0 ? 0 : qq]; }
+        e->gcount = vc2_encgpu_count(e->gpu, q, r, &e->gpu_ms);
+    }
     if (!e->cb[q]) { e->cb[q] = malloc((size_t)e->nslices * 3 * 2); e->cut[q] = malloc((size_t)e->nslices * 3 * 2); e->valid[q] = calloc(e->ny, 4); }
     e->eval_q = q; e->eval_r0 = r0; e->eval_rows = rows;
     if (e->valid[q][rows ? rows[0] : r0] != e->frame + 1) n_eval++;
@@ -813,7 +834,10 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
 {
     double t0 = now(); n_eval = 0;
     e->in = plane; e->in_stride = stride;
-    if (e->gpu && gpu_wavelet(e)) {
+    e->gpu_frame = 0;
+    e->gcount = 0;
+    if (e->gpu && !gpu_wavelet(e)) e->gpu_frame = 1;
+    else if (e->gpu) {
         fprintf(stderr, "vc2: the GPU front end failed, on the CPU from now on\n");
         vc2_encgpu_free(e->gpu);
         e->gpu = 0;
