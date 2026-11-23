@@ -65,8 +65,16 @@ that.
    GPU, bit-exact, 1.4-1.9 ms per 1080p frame on the Mali-G610 against about 8 ms on one A76; the encoder's CPU
    time falls by 5-6 ms per frame, the frame rate not yet (the CPU waits for the GPU). Then the counting on the
    GPU, the same day: CPU per 1080p frame 47 -> 26 ms, 1080p50 on two A76 cores and the Mali (54 fps), UHD
-   15.7 -> 19.3 fps on four, byte-identical. Open: running the GPU one frame ahead (hides 4 ms of GPU per 1080p
-   frame, 15 at UHD, at the cost of one frame of encoder latency), coalesced counting loads. Forward wavelet and per-slice counting on the GPU:
+   15.7 -> 19.3 fps on four, byte-identical.
+   **Tried and dropped (2026-11-23), both byte-identical:**
+   - *Running the GPU one frame ahead* (two buffer sets, the counting on a second queue): 1080p four threads
+     64.5 -> 69.2 fps, two threads 53.0 -> 54.7, UHD four threads 18.5 -> 19.6, two threads no change. Most of
+     the GPU time is the counting, which sits in the rate control's path; only the wavelet overlaps. About 5 %
+     for one more frame of latency.
+   - *Coalesced counting* (eight neighbouring values per work-item, sums per slice in local memory): slower on
+     the Mali-G610 (GPU 5.4 -> 6.3 ms per 1080p frame); its caches already serve the per-segment loop.
+   What is left on the GPU side: fewer counting round trips per frame (several quantisers in one launch, which
+   on the GPU costs nothing extra in rows, unlike on the CPU). Forward wavelet and per-slice counting on the GPU:
    - the input planes from the dma-heap (a capture or decoder buffer can be imported as a dma-buf, no copy);
    - the wavelet as the decoder's kernel in reverse (blocks of band rows, one launch per band of rows for all
      components);
