@@ -532,7 +532,11 @@ last packet. Live, the Mali path is slower than in the encoder benchmark (17.9 m
 idles between frames and its governor (`simple_ondemand`, 300-850 MHz) kept it at 500 MHz. A fixed GPU clock is a
 setting of the board, not of this code.
 
-The other way, Pi 5 -> Firefly, four threads: 3 bpp 19.2 ms average (30.0 max), 536 of 1000 frames past their
+With the encoder of the end of that night (direct input, coarse rows in NEON): Pi 5 -> Firefly, 1080p50 3 bpp,
+four threads 15.1 ms average (26.6 max), 19 of 1000 late; three threads 16.1 ms (22.1 max), 11 late; 0 lost. The
+Firefly with only two encoder threads (and the sender on a third core): 19.1 ms, 387 late, at the edge.
+
+Earlier the same night, Pi 5 -> Firefly, four threads: 3 bpp 19.2 ms average (30.0 max), 536 of 1000 frames past their
 slot; 2.5 bpp 17.7 ms, 86 late; 0 lost either way. The Pi 5 here runs `ondemand` with a 1.5 GHz floor: paced live
 it sat at 1.6 GHz, where the flat-out benchmark (59 fps) keeps 2.4 GHz. A live encoder wants its cores at a fixed
 clock (as the FPGA card's receiver does, docs/FPGA.md section 10).
