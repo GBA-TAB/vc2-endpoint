@@ -44,7 +44,8 @@ typedef struct { uint16_t m, m2, qf; uint8_t s, s2, k, mode, av, af; } cnt16; //
 static const cnt16 c16_off = { 0 };
 static int getenv_no16c = -1; // VC2_NO16C=1: the 16-bit rows through the generic counter
 static int getenv_nogc;       // VC2_NO_GPU_COUNT=1: with the GPU front end, count on the CPU
-typedef struct { rowref *rows; uint32_t *bits, *dd; int32_t *tmp, *gather; uint8_t *obuf; } escratch;
+#define WV_H 4 // halo row pairs of a wavelet strip (analyse_strip16)
+typedef struct { rowref *rows; uint32_t *bits, *dd; int32_t *tmp, *gather; uint8_t *obuf; int16_t *halo; } escratch;
 
 struct vc2_enc {
     vc2_enc_cfg c;
@@ -57,6 +58,7 @@ struct vc2_enc {
     // levels l >= l16 are transformed and stored in 16 bits: LeGall 5,3, depth 4, 10-bit, where the bounds are
     // proven (every band and every sum inside a lifting step of the two finest levels below 32768); else depth + 1
     int l16;
+    int wv_level, wv_job[64][3], wv_strips; // the 16-bit levels in strips: the level being run, (plane, strip, strips)
     vc2_encgpu *gpu;            // the GPU front end, when set (vc2_enc_set_gpu)
     double gpu_ms;
     int gpu_frame;              // this frame's 16-bit bands came from the GPU
@@ -183,10 +185,12 @@ vc2_enc *vc2_enc_new(const vc2_enc_cfg *c)
         e->scr[i].gather = vc2_alloc((gather_n + 64) * 4);
         e->scr[i].tmp = vc2_alloc((size_t)(g->pw + 64) * 2 * 4);
         e->scr[i].obuf = malloc(4 + 3 * 65536 + 64);
+        e->scr[i].halo = vc2_alloc((size_t)4 * 2 * WV_H * (g->pw / 2 + 64) * 2);
     }
     for (int q = 0; q < VC2_NQ; q++) e->r16[q] = (float)(16.0 / vc2_qf[q] * (1.0 + 1.0 / (1 << 20)));
     for (int q = 0; q < VC2_NQ; q++) c16_init(&e->c16[q], vc2_qf[q], e->r16[q]);
     if (getenv_no16c < 0) getenv_no16c = getenv("VC2_NO16C") != 0;
+    e->wv_strips = getenv("VC2_WV_STRIPS") ? atoi(getenv("VC2_WV_STRIPS")) : 0; // 0: automatic, 1: one job per plane
     getenv_nogc = getenv("VC2_NO_GPU_COUNT") != 0;
     e->sq = malloc(e->nslices);
     e->soff = malloc((e->nslices + 1) * sizeof *e->soff);
@@ -208,7 +212,7 @@ void vc2_enc_free(vc2_enc *e)
             free(p->ll[l]); free(p->ll16[l]); free(p->xs[l]); free(p->ys[l]);
         }
     }
-    for (int i = 0; i < th; i++) { free(e->scr[i].rows); free(e->scr[i].bits); free(e->scr[i].dd); free(e->scr[i].tmp); free(e->scr[i].gather); free(e->scr[i].obuf); }
+    for (int i = 0; i < th; i++) { free(e->scr[i].rows); free(e->scr[i].bits); free(e->scr[i].dd); free(e->scr[i].tmp); free(e->scr[i].gather); free(e->scr[i].obuf); free(e->scr[i].halo); }
     for (int q = 0; q < VC2_NQ; q++) { free(e->cb[q]); free(e->cut[q]); free(e->valid[q]); }
     free(e->scr); free(e->sq); free(e->soff);
     free(e);
@@ -377,6 +381,121 @@ static int gpu_wavelet(vc2_enc *e)
     }
     vc2_pool_run(e->pool, gpu_coarse_job, e, 3);
     return 0;
+}
+
+static inline int16_t *row16(int16_t *const bands[4], int16_t *halo, int k, int i, int r0, int r1, int ps, int pe, int w)
+{
+    if (i >= r0 && i < r1) return bands[k] + (size_t)i * w;
+    if (i < ps) i = ps;
+    if (i >= pe) i = pe - 1;
+    int hr = i < r0 ? i - ps : WV_H + (i - r1); // top halo rows, then bottom ones
+    return halo + ((size_t)k * 2 * WV_H + (size_t)hr) * w;
+}
+
+// A strip of a 16-bit level: band rows [r0, r1) of every band, so that several threads share one plane. The strip
+// starts WV_H row pairs early and ends WV_H late; those rows go to the thread's own halo buffer (2 WV_H rows per
+// band), never to the bands, which hold only the rows the strip owns. With the 5,3 steps a row's error reaches one
+// row, so the owned rows equal the whole-level transform (checked by comparing the output with VC2_WV_STRIPS=1).
+static void analyse_strip16(const vc2_wavelet *wl, const int16_t *in, ptrdiff_t istride, int w, int h, int16_t *bands[4], int16_t *tmp,
+                            int r0, int r1, int16_t *halo)
+{
+    const int ns = wl->nsteps, sh = wl->shift, hw = (w + 2 * VC2_G + 7) & ~7;
+    const int ps = r0 - WV_H > 0 ? r0 - WV_H : 0, pe = r1 + WV_H < h ? r1 + WV_H : h;
+    int16_t *lo = tmp + VC2_G, *hi = tmp + hw + VC2_G;
+    int done[5], rlo[5], rhi[5], tg[5];
+    for (int k = 0; k <= ns; k++) done[k] = ps;
+    for (int k = 1; k <= ns; k++) { const vc2_step *st = &wl->st[ns - k]; tg[k] = st->tgt; vc2_step_reach(st, &rlo[k], &rhi[k]); }
+    // row i of band k: owned rows in the band, the others in the halo; rows before the strip read its first row
+#define ROW(k, i) row16(bands, halo, k, i, r0, r1, ps, pe, w)
+#define CLAMP(i) ((i) < 0 ? 0 : (i) >= h ? h - 1 : (i))
+    for (int p = ps; p <= pe; p++) {
+        if (p < pe) {
+            for (int y = 2 * p; y < 2 * p + 2; y++) {
+                const int16_t *r = in + (size_t)y * istride;
+                for (int x = 0; x < w; x++) { lo[x] = (int16_t)(r[2 * x] << sh); hi[x] = (int16_t)(r[2 * x + 1] << sh); }
+                for (int j = ns - 1; j >= 0; j--) vc2_lift_h_16(lo, hi, w, &wl->st[j], -wl->st[j].sign);
+                memcpy(ROW((y & 1) * 2, y / 2), lo, w * 2);
+                memcpy(ROW((y & 1) * 2 + 1, y / 2), hi, w * 2);
+            }
+            done[0] = p + 1;
+        }
+        for (int k = 1; k <= ns; k++) {
+            const vc2_step *st = &wl->st[ns - k];
+            const int t = tg[k], off = t ? -1 : -2;
+            for (;;) {
+                int i = done[k];
+                if (i >= pe) break;
+                int need = i + rhi[k] > h - 1 ? h - 1 : i + rhi[k];
+                if (need >= pe || done[k - 1] <= need) break;
+                if (k >= 2) {
+                    int last = i - rlo[k - 1];
+                    if ((last >= h - 1 || i == h - 1) ? done[k - 1] < h : done[k - 1] <= last) break;
+                }
+                for (int half = 0; half < 2; half++)
+                    vc2_lift_16(ROW(t * 2 + half, i), ROW(t * 2 + half, i), ROW(!t * 2 + half, CLAMP(i + off)), ROW(!t * 2 + half, CLAMP(i + off + 1)),
+                                ROW(!t * 2 + half, CLAMP(i + off + 2)), ROW(!t * 2 + half, CLAMP(i + off + 3)), w, st, -st->sign);
+                done[k] = i + 1;
+            }
+        }
+    }
+#undef ROW
+#undef CLAMP
+}
+
+// the 16-bit levels in strips: the input conversion, then each level with all its strips (a pool run each), then
+// the 32-bit levels per plane
+static void wv_in_job(void *arg, int job, int thread)
+{
+    (void)thread;
+    vc2_enc *e = arg;
+    eplane *p = &e->pl[job];
+    const int w = p->g.w, h = p->g.h, pw = p->g.pw, ph = p->g.ph, off = 1 << (e->c.bit_depth - 1), max = (1 << e->c.bit_depth) - 1;
+    for (int y = 0; y < ph; y++) {
+        const uint16_t *s = e->in[job] + (size_t)(y < h ? y : h - 1) * e->in_stride[job];
+        int16_t *d = p->img16 + (size_t)y * pw;
+        for (int x = 0; x < w; x++) d[x] = (int16_t)((s[x] > max ? max : (int32_t)s[x]) - off);
+        for (int x = w; x < pw; x++) d[x] = d[w - 1];
+    }
+}
+static void wv_strip_job(void *arg, int job, int thread)
+{
+    vc2_enc *e = arg;
+    const int c = e->wv_job[job][0], k = e->wv_job[job][1], n = e->wv_job[job][2], l = e->wv_level;
+    eplane *p = &e->pl[c];
+    const int h = p->g.bh[l], r0 = (int)((int64_t)h * k / n), r1 = (int)((int64_t)h * (k + 1) / n);
+    const int16_t *in = l == e->c.depth ? p->img16 : p->ll16[l];
+    int16_t *bands[4] = { p->ll16[l - 1], p->band16[l][1], p->band16[l][2], p->band16[l][3] };
+    analyse_strip16(e->wl, in, 2 * p->g.bw[l], p->g.bw[l], h, bands, (int16_t *)e->scr[thread].tmp, r0, r1, e->scr[thread].halo);
+}
+static void wv_rest_job(void *arg, int job, int thread)
+{
+    vc2_enc *e = arg;
+    eplane *p = &e->pl[job];
+    int32_t *ll = e->l16 == 1 ? p->band[0][0] : p->ll[e->l16 - 1];
+    for (size_t i = 0, n = (size_t)p->g.bw[e->l16] * p->g.bh[e->l16]; i < n; i++) ll[i] = p->ll16[e->l16 - 1][i];
+    for (int l = e->l16 - 1; l >= 1; l--) {
+        const int32_t *in = p->ll[l];
+        int32_t *bands[4] = { l == 1 ? p->band[0][0] : p->ll[l - 1], p->band[l][1], p->band[l][2], p->band[l][3] };
+        analyse_level(e->wl, in, 2 * p->g.bw[l], p->g.bw[l], p->g.bh[l], bands, e->scr[thread].tmp);
+    }
+}
+// strips per component: enough that the luma does not hold the others up (luma has twice the samples of a chroma
+// plane in 4:2:2), at least 8 band rows each
+static void wavelet_strips(vc2_enc *e)
+{
+    const int th = vc2_pool_threads(e->pool);
+    vc2_pool_run(e->pool, wv_in_job, e, 3);
+    for (int l = e->c.depth; l >= e->l16; l--) {
+        int nj = 0;
+        for (int c = 0; c < 3; c++) {
+            int n = e->wv_strips > 0 ? e->wv_strips : c == 0 && th >= 4 ? 2 : 1;
+            if (n > e->pl[c].g.bh[l] / 8) n = e->pl[c].g.bh[l] / 8 > 0 ? e->pl[c].g.bh[l] / 8 : 1;
+            for (int k = 0; k < n && nj < 64; k++) { e->wv_job[nj][0] = c; e->wv_job[nj][1] = k; e->wv_job[nj][2] = n; nj++; }
+        }
+        e->wv_level = l;
+        vc2_pool_run(e->pool, wv_strip_job, e, nj);
+    }
+    vc2_pool_run(e->pool, wv_rest_job, e, 3);
 }
 
 static void plane_job(void *arg, int job, int thread)
@@ -873,7 +992,10 @@ size_t vc2_enc_encode(vc2_enc *e, const uint16_t *const plane[3], const ptrdiff_
         e->gpu = 0;
         for (int c = 0; c < 3; c++) for (int l = 0; l <= VC2_MAX_DEPTH; l++) for (int o = 0; o < 4; o++) e->pl[c].band16[l][o] = e->pl[c].own16[l][o];
     }
-    if (!e->gpu) vc2_pool_run(e->pool, plane_job, e, 3);
+    if (!e->gpu) {
+        if (e->l16 <= e->c.depth && e->wv_strips != 1 && vc2_pool_threads(e->pool) > 1) wavelet_strips(e);
+        else vc2_pool_run(e->pool, plane_job, e, 3);
+    }
     double t1 = now();
 
     const int unit = e->c.rc_rows > 0 && e->c.rc_rows < e->ny ? e->c.rc_rows : e->ny;

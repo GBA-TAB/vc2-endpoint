@@ -183,6 +183,13 @@ counting 23.8 -> 21.7 ms (Pi 5) and 23.5 -> 21.2 ms (Firefly) per frame on one c
 uses the same exact constants (it needs only v): Firefly writer 11.8 -> 10.7 ms per frame on one core, four
 threads 65.6 -> 67.4 fps, the same bytes in 120 cases on both boards.
 
+**The 16-bit levels in strips.** With one job per plane the luma (half the samples) held the wavelet up when
+there are four threads. Each 16-bit level now runs as strips: the luma in two with four threads, each strip
+starting and ending four row pairs early and late into the thread's own halo rows, so only owned rows reach the
+bands. The same bytes with 1 to 7 strips per plane (99 cases); `VC2_WV_STRIPS=n` forces n strips, 1 the old
+order. Firefly four threads 68.3 -> 74.3 fps (wavelet 4.7 -> 3.5 ms); Pi 5 54.5 -> 56 fps (its wavelet is
+bound by memory bandwidth).
+
 **The front end on Mali (`make GPU=cl`, `vc2enc --gpu cl`).** The two 16-bit levels as an OpenCL kernel
 (`lib/vc2_fwd.cl`, `lib/vc2_enc_cl.c`): one work-item per 8 band columns and 16 band rows, horizontal lifting
 per row, the vertical steps in a rolling window, one row pair recomputed above each strip. Bit-exact: all 5.2
