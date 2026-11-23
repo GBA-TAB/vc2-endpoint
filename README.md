@@ -37,6 +37,7 @@ board; that work is not part of this repo, and no JPEG XS code is.
 | `scripts/verify.sh` | bit-exactness against ffmpeg's decoder |
 | `docs/RTP.md` | the RTP mapping and what is open |
 | `lib/vc2_enc_cl.c`, `vc2_fwd.cl`, `vc2_enc_gpu.h` | the encoder's GPU front end (OpenCL, Mali): the two finest forward levels, bit-exact |
+| `scripts/enc-check.sh` | the encoder's fast paths against its plain ones, byte for byte (sizes, wavelets, rates, modes, fixed q, the GPU front end): run after every encoder change |
 | `docs/GPU-ROUTE.md` | the GPU plan: encoder steps on the RK3588 boards (libmali), then CUDA for streams per GPU (memory, entropy, PCIe limits) |
 | `docs/FPGA.md` | a hardware (FPGA) decoder: the subset, the exact arithmetic, the reference vectors (`scripts/fpga-vectors.sh`) |
 
